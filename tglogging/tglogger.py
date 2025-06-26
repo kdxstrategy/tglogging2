@@ -10,21 +10,17 @@ nest_asyncio.apply()
 
 DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
-
 class TelegramLogHandler(StreamHandler):
     """
-    Handler to send logs to telegram chats.
+    Handler to send logs to telegram chats with thread/topic support.
 
     Parameters:
-        token: a telegram bot token to interact with telegram API.
-        log_chat_id: chat id of chat to which logs are to be send.
-        update_interval: interval between two posting in seconds.
-                            lower intervals will lead to floodwaits.
-                            recommended to use greater than 5 sec
-        minimum_lines: minimum number of new lines required to post / edit a message.
-        pending_logs: maximum number of letters for pending logs to send as file.
-                        default to 200000. usefull for apps producing lengthy logs withing few minutes.
-
+        token: Telegram bot token
+        log_chat_id: Chat ID of the target supergroup
+        topic_id: Thread/topic ID (optional)
+        update_interval: Seconds between posts (min 5 recommended)
+        minimum_lines: Minimum new lines required to post/edit
+        pending_logs: Max characters before sending as file (default 200000)
     """
 
     def __init__(
@@ -39,8 +35,8 @@ class TelegramLogHandler(StreamHandler):
         StreamHandler.__init__(self)
         self.loop = asyncio.get_event_loop()
         self.token = token
-        self.log_chat_id = log_chat_id
-        self.topic_id = topic_id
+        self.log_chat_id = int(log_chat_id)
+        self.topic_id = int(topic_id) if topic_id else None
         self.wait_time = update_interval
         self.minimum = minimum_lines
         self.pending = pending_logs
@@ -51,8 +47,7 @@ class TelegramLogHandler(StreamHandler):
         self.lines = 0
         self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
-        DEFAULT_PAYLOAD.update({"chat_id": log_chat_id})
-
+        DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
 
     def emit(self, record):
         msg = self.format(record)
@@ -69,34 +64,31 @@ class TelegramLogHandler(StreamHandler):
     async def handle_logs(self):
         if len(self.messages) > self.pending:
             _msg = self.messages
-            msg = _msg.rsplit("\n", 1)[0]
-            if not msg:
-                msg = _msg
+            msg = _msg.rsplit("\n", 1)[0] or _msg
             self.current_msg = ""
             self.message_id = 0
-            self.messages = self.messages[len(msg) :]
-            await self.send_as_file(msg)  # sending as document
+            self.messages = self.messages[len(msg):]
+            await self.send_as_file(msg)
             return
-        _message = self.messages[:4050]  # taking first 4050 characters
-        msg = _message.rsplit("\n", 1)[0]
-        if not msg:
-            msg = _message
+
+        _message = self.messages[:4050]  # Telegram message length limit
+        msg = _message.rsplit("\n", 1)[0] or _message
         letter_count = len(msg)
-        # removing these messages from the list
         self.messages = self.messages[letter_count:]
+
         if not self.message_id:
             uname, is_alive = await self.verify_bot()
             if not is_alive:
-                print("TGLogger: [ERROR] - Invalid bot token provided.")
-            await self.initialise()  # Initializing by sending a message
+                print("TGLogger: [ERROR] - Invalid bot token")
+                return
+            await self.initialise()
             await self.edit_message(f"Logging started by @{uname}")
+
         computed_message = self.current_msg + msg
         if len(computed_message) > 4050:
             _to_edit = computed_message[:4050]
-            to_edit = _to_edit.rsplit("\n", 1)[0]
-            if not to_edit:
-                to_edit = _to_edit  # incase of lengthy lines
-            to_new = computed_message[len(to_edit) :]
+            to_edit = _to_edit.rsplit("\n", 1)[0] or _to_edit
+            to_new = computed_message[len(to_edit):]
             if to_edit != self.current_msg:
                 await self.edit_message(to_edit)
             self.current_msg = to_new
@@ -107,82 +99,67 @@ class TelegramLogHandler(StreamHandler):
 
     async def send_request(self, url, payload):
         async with ClientSession() as session:
-            async with session.request("POST", url, json=payload) as response:
-                e = await response.json()
-                return e
+            async with session.post(url, json=payload) as response:
+                return await response.json()
 
     async def verify_bot(self):
         res = await self.send_request(f"{self.base_url}/getMe", {})
-        if res.get("error_code") == 401 and res.get("description") == "Unauthorized":
+        if res.get("error_code") == 401:
             return None, False
-        elif res.get("result").get("username"):
-            return res.get("result").get("username"), True
+        return res.get("result", {}).get("username"), True
 
     async def initialise(self):
         payload = DEFAULT_PAYLOAD.copy()
         payload["text"] = "```Initializing```"
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
 
-        url = f"{self.base_url}/sendMessage"
-        res = await self.send_request(url, payload)
+        res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
-            result = res.get("result")
-            self.message_id = result.get("message_id")
-        else:
-            await self.handle_error(res)
+            self.message_id = res["result"]["message_id"]
 
     async def send_message(self, message):
         payload = DEFAULT_PAYLOAD.copy()
         payload["text"] = f"```{message}```"
-        url = f"{self.base_url}/sendMessage"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
-        res = await self.send_request(url, payload)
+
+        res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
-            result = res.get("result")
-            self.message_id = result.get("message_id")
-        else:
-            await self.handle_error(res)
+            self.message_id = res["result"]["message_id"]
 
     async def edit_message(self, message):
         payload = DEFAULT_PAYLOAD.copy()
         payload["message_id"] = self.message_id
         payload["text"] = f"```{message}```"
-        url = f"{self.base_url}/editMessageText"
-        res = await self.send_request(url, payload)
-        if not res.get("ok"):
-            await self.handle_error(res)
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
+
+        await self.send_request(f"{self.base_url}/editMessageText", payload)
 
     async def send_as_file(self, logs):
         file = io.BytesIO(logs.encode())
-        file.name = "tglogging.logs"
-        url = f"{self.base_url}/sendDocument"
+        file.name = "logs.txt"
         payload = DEFAULT_PAYLOAD.copy()
-        payload["caption"] = "Too much logs to send and hence sending as file."
+        payload["caption"] = "Logs (too large for message)"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
-        files = {"document": file}
-        with contextlib.suppress(BaseException):
-            del payload["disable_web_page_preview"]
+
         async with ClientSession() as session:
-            async with session.request(
-                "POST", url, params=payload, data=files
+            data = aiohttp.FormData()
+            data.add_field('document', file, filename='logs.txt')
+            async with session.post(
+                f"{self.base_url}/sendDocument",
+                data=data,
+                params=payload
             ) as response:
-                res = await response.json()
-        if res.get("ok"):
-            print("Logs send as a file since there were too much lines to print.")
-        else:
-            await self.handle_error(res)
+                await response.json()
 
     async def handle_error(self, resp: dict):
         error = resp.get("parameters", {})
-        if not error:
-            if (
-                resp.get("error_code") == 401
-                and resp.get("description") == "Unauthorized"
-            ):
-                return
-            print(f"Errors while updating TG logs {resp}")
-            return
-        if error.get("retry_after"):
-            self.floodwait = error.get("retry_after")
-            print(f'Floodwait of {error.get("retry_after")} and sleeping')
+        if resp.get("description") == "message thread not found":
+            print(f"Thread {self.topic_id} not found - resetting")
+            self.message_id = 0
+        elif error.get("retry_after"):
+            self.floodwait = error["retry_after"]
+            print(f'Floodwait: {self.floodwait} seconds')
