@@ -64,7 +64,7 @@ class TelegramLogHandler(StreamHandler):
             await self.send_as_file(msg)
             return
 
-        _message = self.messages[:4050]  # Telegram message length limit
+        _message = self.messages[:3000]  # Telegram message length limit
         msg = _message.rsplit("\n", 1)[0] or _message
         letter_count = len(msg)
         self.messages = self.messages[letter_count:]
@@ -82,7 +82,7 @@ class TelegramLogHandler(StreamHandler):
         computed_message = self.current_msg + msg
         
         # FIX: When exceeding limit, finalize current message and start new one
-        if len(computed_message) > 4050:
+        if len(computed_message) > 3000:
             # Send current message as is
             if self.current_msg:
                 await self.edit_message(self.current_msg)
