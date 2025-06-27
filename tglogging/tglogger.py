@@ -15,13 +15,8 @@ DEFAULT_PAYLOAD = {
 
 class TelegramLogHandler(StreamHandler):
     """
-    Thread-aware Telegram logging handler that preserves message history.
-    
-    Features:
-    - Separate message tracking per thread
-    - Automatic file upload for large logs
-    - Flood control
-    - Markdown formatting
+    Fixed Telegram logging handler that properly handles message limits
+    without replacing previous logs in threads.
     """
 
     def __init__(
@@ -41,24 +36,36 @@ class TelegramLogHandler(StreamHandler):
         self.wait_time = update_interval
         self.minimum = minimum_lines
         self.pending = pending_logs
-        self.messages = ""
         self.floodwait = 0
         self.lines = 0
         self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
         
-        # Thread-specific message tracking
-        self.thread_messages = {}  # Format: {topic_id: message_id}
-        
-        # Initialize default payload
+        # Per-thread message tracking
+        self.thread_buffers = {}  # {topic_id: {"buffer": "", "message_id": None}}
         self.default_payload = DEFAULT_PAYLOAD.copy()
         self.default_payload["chat_id"] = self.log_chat_id
+        
+        # Initialize buffer for this thread
+        self._get_thread_buffer()
+
+    def _get_thread_buffer(self):
+        """Get or create buffer for current thread"""
+        buffer_key = self.topic_id or "main"
+        if buffer_key not in self.thread_buffers:
+            self.thread_buffers[buffer_key] = {
+                "buffer": "",
+                "message_id": None
+            }
+        return self.thread_buffers[buffer_key]
 
     def emit(self, record):
         """Queue log messages for processing"""
         msg = self.format(record)
         self.lines += 1
-        self.messages += f"{msg}\n"
+        
+        buffer = self._get_thread_buffer()
+        buffer["buffer"] += f"{msg}\n"
         
         # Trigger processing if conditions met
         diff = time.time() - self.last_update
@@ -70,32 +77,56 @@ class TelegramLogHandler(StreamHandler):
             self.last_update = time.time()
 
     async def _process_logs(self):
-        """Process accumulated logs"""
-        if len(self.messages) > self.pending:
-            await self._send_oversized_logs()
+        """Process accumulated logs without replacing existing messages"""
+        buffer = self._get_thread_buffer()
+        buffer_content = buffer["buffer"]
+        
+        if not buffer_content:
             return
             
-        # Process normal messages
-        msg_chunk = self.messages[:4050].rsplit("\n", 1)[0] or self.messages[:4050]
-        self.messages = self.messages[len(msg_chunk):]
-        
-        if not self._get_current_message_id():
-            await self._initialize_thread()
-        
-        await self._send_or_update(msg_chunk)
-
-    async def _send_or_update(self, message):
-        """Smart message delivery with thread awareness"""
-        current_msg_id = self._get_current_message_id()
-        
-        # Only edit if we have an existing recent message
-        if current_msg_id and (time.time() - self.last_update < 3600):
-            await self._edit_message(message, current_msg_id)
-        else:
-            await self._send_new_message(message)
+        # Handle oversized logs as file
+        if len(buffer_content) > self.pending:
+            await self._send_as_file(buffer_content)
+            buffer["buffer"] = ""
+            buffer["message_id"] = None
+            return
+            
+        # Process all content in the buffer
+        while buffer_content:
+            # Get current message buffer
+            current_msg = buffer["message_id"]
+            current_content = buffer["buffer"]
+            
+            # Calculate available space (Telegram limit is 4096 chars)
+            max_chunk = 4096 - len("```\n```")  # Account for Markdown formatting
+            
+            # Get next chunk that fits in a message
+            if len(current_content) <= max_chunk:
+                chunk = current_content
+                buffer_content = ""
+            else:
+                # Find last newline within limit to avoid breaking lines
+                chunk = current_content[:max_chunk]
+                last_newline = chunk.rfind('\n') + 1
+                if last_newline > 0:
+                    chunk = current_content[:last_newline]
+                else:
+                    # No newline found - force break
+                    chunk = current_content[:max_chunk]
+                buffer_content = current_content[len(chunk):]
+            
+            # Send or update message
+            if current_msg and (time.time() - self.last_update < 3600):
+                await self._update_message(chunk, current_msg)
+            else:
+                new_msg_id = await self._send_new_message(chunk)
+                buffer["message_id"] = new_msg_id
+            
+            # Update buffer with remaining content
+            buffer["buffer"] = buffer_content
 
     async def _send_new_message(self, message):
-        """Send a brand new message to the thread"""
+        """Send a new message to the thread and return its ID"""
         payload = self.default_payload.copy()
         payload["text"] = f"```{message}```"
         
@@ -108,10 +139,11 @@ class TelegramLogHandler(StreamHandler):
         )
         
         if response.get("ok"):
-            self._update_message_id(response["result"]["message_id"])
+            return response["result"]["message_id"]
+        return None
 
-    async def _edit_message(self, message, message_id):
-        """Edit an existing message"""
+    async def _update_message(self, message, message_id):
+        """Update existing message with new content"""
         payload = self.default_payload.copy()
         payload.update({
             "message_id": message_id,
@@ -126,88 +158,33 @@ class TelegramLogHandler(StreamHandler):
             payload
         )
         
-        # If edit fails, fall back to new message
+        # If edit fails, create new message
         if not response.get("ok"):
-            await self._send_new_message(message)
+            new_msg_id = await self._send_new_message(message)
+            buffer = self._get_thread_buffer()
+            buffer["message_id"] = new_msg_id
 
-    async def _send_oversized_logs(self):
-        """Handle logs that exceed size limits"""
-        msg = self.messages.rsplit("\n", 1)[0] or self.messages
-        self.messages = self.messages[len(msg):]
-        
-        file = io.BytesIO(msg.encode())
+    async def _send_as_file(self, logs):
+        """Send large logs as a text file"""
+        file = io.BytesIO(logs.encode())
         file.name = "logs.txt"
         
         payload = self.default_payload.copy()
-        payload["caption"] = "Logs (exceeded size limit)"
+        payload["caption"] = "Log batch (exceeded size limit)"
         
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
             
-        async with ClientSession() as session:
-            data = FormData()
-            data.add_field('document', file, filename='logs.txt')
-            async with session.post(
-                f"{self.base_url}/sendDocument",
-                data=data,
-                params=payload
-            ) as response:
-                await response.json()
+        try:
+            async with ClientSession() as session:
+                data = FormData()
+                data.add_field('document', file, filename='logs.txt')
+                await session.post(
+                    f"{self.base_url}/sendDocument",
+                    data=data,
+                    params=payload
+                )
+        except Exception as e:
+            print(f"Failed to send file: {e}")
         
-        # Reset message tracking after file upload
-        self._update_message_id(None)
-
-    async def _initialize_thread(self):
-        """Initialize message tracking for the thread"""
-        payload = self.default_payload.copy()
-        payload["text"] = "```Logging initialized```"
-        
-        if self.topic_id:
-            payload["message_thread_id"] = self.topic_id
-            
-        response = await self._send_request(
-            f"{self.base_url}/sendMessage",
-            payload
-        )
-        
-        if response.get("ok"):
-            self._update_message_id(response["result"]["message_id"])
-
-    def _get_current_message_id(self):
-        """Get message ID for current thread"""
-        return self.thread_messages.get(self.topic_id)
-
-    def _update_message_id(self, message_id):
-        """Update message tracking for current thread"""
-        if self.topic_id is None:
-            return
-        self.thread_messages[self.topic_id] = message_id
-
-    async def _send_request(self, url, payload):
-        """Universal request handler with error management"""
-        async with ClientSession() as session:
-            async with session.post(url, json=payload) as response:
-                data = await response.json()
-                if not data.get("ok"):
-                    await self._handle_error(data)
-                return data
-
-    async def _handle_error(self, response):
-        """Handle API errors"""
-        error = response.get("parameters", {})
-        
-        # Special handling for thread errors
-        if response.get("description") == "message thread not found":
-            print(f"Thread {self.topic_id} not found - resetting")
-            self._update_message_id(None)
-            
-        # Flood control
-        elif error.get("retry_after"):
-            self.floodwait = error["retry_after"]
-            print(f'Floodwait: {self.floodwait} seconds')
-            
-        # Other errors
-        elif response.get("error_code") == 401:
-            print("Invalid bot token")
-        else:
-            print(f"Telegram API error: {response}")
+        # Reset b
