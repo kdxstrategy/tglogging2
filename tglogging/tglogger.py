@@ -3,7 +3,7 @@ import io
 import time
 import asyncio
 import nest_asyncio
-from logging import StreamHandler, getLogger
+from logging import StreamHandler, getLogger, Formatter
 from aiohttp import ClientSession, FormData
 from collections import defaultdict
 
@@ -11,15 +11,33 @@ nest_asyncio.apply()
 
 DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
+class ConsistentHeaderFormatter(Formatter):
+    """Custom formatter to ensure consistent k_server prefix"""
+    def format(self, record):
+        # First format with the standard formatting
+        formatted = super().format(record)
+        
+        # Ensure the message starts with k_server
+        if not formatted.startswith("k_server"):
+            # Remove any existing prefix up to the first space
+            parts = formatted.split(' ', 1)
+            if len(parts) > 1:
+                return f"k_server {parts[1]}"
+            return f"k_server {formatted}"
+        return formatted
+
 class TelegramLogHandler(StreamHandler):
     """
-    Robust handler with floodwait recovery and cross-thread message verification.
-    Ensures no messages are lost after rate limiting.
+    Robust Telegram log handler with:
+    - Consistent k_server message headers
+    - Floodwait recovery
+    - Cross-thread verification
+    - No initialization message
     """
     
     _last_global_update = 0
     _active_handlers = []
-    _message_registry = defaultdict(dict)  # {chat_id: {message_id: content}}
+    _message_registry = defaultdict(dict)
     _lock = asyncio.Lock()
 
     def __init__(
@@ -32,6 +50,10 @@ class TelegramLogHandler(StreamHandler):
         pending_logs: int = 200000,
     ):
         StreamHandler.__init__(self)
+        self.setFormatter(ConsistentHeaderFormatter(
+            fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
         self.loop = asyncio.get_event_loop()
         self.token = token
         self.log_chat_id = int(log_chat_id)
@@ -47,7 +69,7 @@ class TelegramLogHandler(StreamHandler):
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.initialized = False
         self.last_edit_time = 0
-        self._pending_messages = []  # Messages waiting during floodwait
+        self._pending_messages = []
         DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self._register_handler()
 
@@ -55,20 +77,15 @@ class TelegramLogHandler(StreamHandler):
         """Register this handler for global tracking"""
         TelegramLogHandler._active_handlers.append(self)
 
-    async def _verify_message_sent(self, chat_id, message_id, expected_content):
-        """Verify if message was actually delivered"""
-        async with self._lock:
-            if chat_id in self._message_registry:
-                if message_id in self._message_registry[chat_id]:
-                    return self._message_registry[chat_id][message_id] == expected_content
-        return False
-
-    async def _register_sent_message(self, chat_id, message_id, content):
-        """Track successfully sent messages"""
-        async with self._lock:
-            self._message_registry[chat_id][message_id] = content
+    def format(self, record):
+        """Final formatting safeguard"""
+        formatted = super().format(record)
+        if not formatted.startswith("k_server"):
+            return f"k_server {formatted}"
+        return formatted
 
     def emit(self, record):
+        """Handle log emission with consistent prefix"""
         msg = self.format(record)
         self.lines += msg.count('\n') + 1
         self.message_buffer.append(msg)
@@ -87,7 +104,7 @@ class TelegramLogHandler(StreamHandler):
             self._last_global_update = current_time
 
     async def _process_messages(self, force_send=False):
-        """Process messages with floodwait recovery and verification"""
+        """Process messages with floodwait recovery"""
         if not self.message_buffer:
             return
 
@@ -122,7 +139,10 @@ class TelegramLogHandler(StreamHandler):
             self._pending_messages = [messages]
 
     async def _send_chunk(self, chunk):
-        """Send a message chunk with delivery verification"""
+        """Send a message chunk with header verification"""
+        if not chunk.startswith("k_server"):
+            chunk = f"k_server {chunk}"
+            
         if self.message_id:
             if chunk != self.current_msg:
                 success = await self._safe_edit_message(chunk)
@@ -133,6 +153,9 @@ class TelegramLogHandler(StreamHandler):
 
     async def _safe_send_message(self, message):
         """Send message with delivery verification"""
+        if not message.startswith("k_server"):
+            message = f"k_server {message}"
+            
         payload = {
             "chat_id": self.log_chat_id,
             "text": f"```{message}```",
@@ -164,7 +187,10 @@ class TelegramLogHandler(StreamHandler):
         return False
 
     async def _safe_edit_message(self, message):
-        """Edit message with rate limiting and verification"""
+        """Edit message with header verification"""
+        if not message.startswith("k_server"):
+            message = f"k_server {message}"
+            
         if time.time() - self.last_edit_time < 1.0:
             return False
             
@@ -204,7 +230,20 @@ class TelegramLogHandler(StreamHandler):
             print(f"Failed to edit message: {e}")
         return False
 
-    async def _create_message_chunks(self, message):
+    async def _verify_message_sent(self, chat_id, message_id, expected_content):
+        """Verify message was delivered with correct content"""
+        async with self._lock:
+            if chat_id in self._message_registry:
+                if message_id in self._message_registry[chat_id]:
+                    return self._message_registry[chat_id][message_id] == expected_content
+        return False
+
+    async def _register_sent_message(self, chat_id, message_id, content):
+        """Track successfully sent messages"""
+        async with self._lock:
+            self._message_registry[chat_id][message_id] = content
+
+    def _create_message_chunks(self, message):
         """Split message into Telegram-friendly chunks"""
         chunks = []
         current_chunk = self.current_msg
@@ -233,43 +272,17 @@ class TelegramLogHandler(StreamHandler):
         return chunks
 
     async def initialize_bot(self):
+        """Initialize without sending a message"""
         uname, is_alive = await self.verify_bot()
         if not is_alive:
             print("TGLogger: [ERROR] - Invalid bot token")
             return False
             
-        payload = {
-            "chat_id": self.log_chat_id,
-            "text": "```Logging initialized```",
-            "disable_web_page_preview": True,
-            "parse_mode": "Markdown"
-        }
-        if self.topic_id:
-            payload["message_thread_id"] = self.topic_id
-
-        try:
-            async with ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/sendMessage",
-                    json=payload
-                ) as response:
-                    res = await response.json()
-                    if res.get("ok"):
-                        self.message_id = res["result"]["message_id"]
-                        self.current_msg = payload["text"]
-                        await self._register_sent_message(
-                            self.log_chat_id,
-                            self.message_id,
-                            payload["text"]
-                        )
-                        self.initialized = True
-                        return True
-                    await self.handle_error(res)
-        except Exception as e:
-            print(f"Initialization failed: {e}")
-        return False
+        self.initialized = True
+        return True
 
     async def verify_bot(self):
+        """Verify bot token is valid"""
         try:
             async with ClientSession() as session:
                 async with session.post(
@@ -285,6 +298,7 @@ class TelegramLogHandler(StreamHandler):
             return None, False
 
     async def handle_error(self, resp: dict):
+        """Handle Telegram API errors"""
         error = resp.get("parameters", {})
         error_code = resp.get("error_code")
         description = resp.get("description", "")
@@ -305,6 +319,7 @@ class TelegramLogHandler(StreamHandler):
             print(f"Telegram API error: {description}")
 
     async def send_as_file(self, logs):
+        """Send large logs as file"""
         if not logs:
             return
             
@@ -312,7 +327,7 @@ class TelegramLogHandler(StreamHandler):
         file.name = "logs.txt"
         payload = {
             "chat_id": self.log_chat_id,
-            "caption": "Logs (too large for message)",
+            "caption": "k_server Logs (too large for message)",
             "disable_web_page_preview": True,
             "parse_mode": "Markdown"
         }
