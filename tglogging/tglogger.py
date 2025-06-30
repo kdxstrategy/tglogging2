@@ -80,7 +80,7 @@ class TelegramLogHandler(StreamHandler):
                 
             # Check if handler meets flush conditions
             time_diff = current_time - handler.last_update
-            if (time_diff >= max(handler.wait_time, handler.floodwait) and handler.lines >= handler.minimum:
+            if (time_diff >= max(handler.wait_time, handler.floodwait) and handler.lines >= handler.minimum):
                 if handler.floodwait:
                     handler.floodwait = 0
                 handler.loop.run_until_complete(handler.handle_logs())
