@@ -1,4 +1,3 @@
-
 import contextlib
 import io
 import time
@@ -61,7 +60,6 @@ class TelegramLogHandler(StreamHandler):
             self.loop.run_until_complete(self.handle_logs(force_send=True))
             self.lines = 0
             self.last_update = time.time()
-            # Continue to check time condition and other handlers
         
         # Check if we should send due to interval
         diff = time.time() - self.last_update
@@ -93,9 +91,9 @@ class TelegramLogHandler(StreamHandler):
         if not self.message_buffer:
             return
 
-        # Combine all pending messages
+        # Save buffer content for potential re-insertion if sending fails
+        buffer_copy = self.message_buffer.copy()
         full_message = '\n'.join(self.message_buffer)
-        self.message_buffer = []  # Clear buffer immediately
         
         if not full_message.strip():
             return
@@ -106,13 +104,14 @@ class TelegramLogHandler(StreamHandler):
             if not success:
                 return
 
-        # Start with current message and append new content
+        # Preserve existing content - don't overwrite during floodwait retries
         if self.current_msg:
             full_message = f"{self.current_msg}\n{full_message}"
-            self.current_msg = ""  # Reset after combination
+        self.current_msg = ""  # Reset after combination
 
         # Split into chunks that fit Telegram's limits
         chunks = self._split_into_chunks(full_message)
+        success = True
         
         # Send/update messages
         for i, chunk in enumerate(chunks):
@@ -122,27 +121,39 @@ class TelegramLogHandler(StreamHandler):
                 
             # For the first chunk, try appending to existing message
             if i == 0 and self.message_id:
-                # Combine with existing content
-                combined_message = chunk
+                # Only combine with existing content if we have it
+                if self.last_sent_content:
+                    # Preserve existing content and append new logs
+                    combined_message = f"{self.last_sent_content}\n{chunk}"
+                else:
+                    combined_message = chunk
                 
                 # Only edit if content has changed
                 if combined_message != self.last_sent_content:
-                    success = await self.edit_message(combined_message)
-                    if success:
-                        self.last_sent_content = combined_message
-                    else:
+                    chunk_success = await self.edit_message(combined_message)
+                    if not chunk_success:
                         # If edit fails, send as new message
-                        await self.send_message(chunk)
+                        chunk_success = await self.send_message(chunk)
                 else:
                     # Skip sending duplicate content
-                    self.current_msg = chunk
+                    chunk_success = True
             else:
                 # Send new message
-                await self.send_message(chunk)
+                chunk_success = await self.send_message(chunk)
+            
+            if not chunk_success:
+                success = False
+                break
         
-        # Store the last chunk for future appends
-        if chunks:
-            self.current_msg = chunks[-1]
+        if success:
+            # Only clear buffer if ALL chunks were sent successfully
+            self.message_buffer = []
+            # Store the last chunk for future appends
+            if chunks:
+                self.current_msg = chunks[-1]
+        else:
+            # If sending failed, preserve the logs in buffer
+            self.message_buffer = buffer_copy
 
     def _split_into_chunks(self, message):
         """Split message into chunks respecting line boundaries and size limits"""
@@ -217,21 +228,26 @@ class TelegramLogHandler(StreamHandler):
 
     async def initialise(self):
         payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = "```Logging initialized```"
+        payload["text"] = "```k-server```"  # Header for initial message
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
-            self.current_msg = payload["text"]
-            self.last_sent_content = payload["text"]
+            # Store content WITHOUT markdown formatting for state consistency
+            self.current_msg = "k-server"  # Header text
+            self.last_sent_content = "k-server"  # Header text
             return True
         return False
 
     async def send_message(self, message):
         if not message.strip():
             return False
+            
+        # Add header only for new messages
+        if not message.startswith("k-server"):
+            message = f"k-server\n{message}"
             
         payload = DEFAULT_PAYLOAD.copy()
         payload["text"] = f"```{message}```"
@@ -241,6 +257,7 @@ class TelegramLogHandler(StreamHandler):
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
+            # Store without formatting for consistency
             self.last_sent_content = message
             return True
             
