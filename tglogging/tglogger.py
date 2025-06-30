@@ -15,7 +15,6 @@ class TelegramLogHandler(StreamHandler):
     """
     Robust handler with floodwait recovery and cross-thread message verification.
     Ensures no messages are lost after rate limiting.
-    Uses 'k_server' as header for all messages.
     """
     
     _last_global_update = 0
@@ -133,10 +132,10 @@ class TelegramLogHandler(StreamHandler):
             await self._safe_send_message(chunk)
 
     async def _safe_send_message(self, message):
-        """Send message with k_server header and delivery verification"""
+        """Send message with delivery verification"""
         payload = {
             "chat_id": self.log_chat_id,
-            "text": f"k_server\n```{message}```",
+            "text": f"```{message}```",
             "disable_web_page_preview": True,
             "parse_mode": "Markdown"
         }
@@ -165,7 +164,7 @@ class TelegramLogHandler(StreamHandler):
         return False
 
     async def _safe_edit_message(self, message):
-        """Edit message with k_server header and rate limiting"""
+        """Edit message with rate limiting and verification"""
         if time.time() - self.last_edit_time < 1.0:
             return False
             
@@ -175,7 +174,7 @@ class TelegramLogHandler(StreamHandler):
         payload = {
             "chat_id": self.log_chat_id,
             "message_id": self.message_id,
-            "text": f"k_server\n```{message}```",
+            "text": f"```{message}```",
             "disable_web_page_preview": True,
             "parse_mode": "Markdown"
         }
@@ -206,7 +205,7 @@ class TelegramLogHandler(StreamHandler):
         return False
 
     async def _create_message_chunks(self, message):
-        """Split message into Telegram-friendly chunks with k_server header"""
+        """Split message into Telegram-friendly chunks"""
         chunks = []
         current_chunk = self.current_msg
         
@@ -241,7 +240,7 @@ class TelegramLogHandler(StreamHandler):
             
         payload = {
             "chat_id": self.log_chat_id,
-            "text": "k_server\n```Logging initialized```",
+            "text": "```Logging initialized```",
             "disable_web_page_preview": True,
             "parse_mode": "Markdown"
         }
@@ -313,7 +312,7 @@ class TelegramLogHandler(StreamHandler):
         file.name = "logs.txt"
         payload = {
             "chat_id": self.log_chat_id,
-            "caption": "k_server - Logs (too large for message)",
+            "caption": "Logs (too large for message)",
             "disable_web_page_preview": True,
             "parse_mode": "Markdown"
         }
