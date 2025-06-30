@@ -5,6 +5,7 @@ import asyncio
 import nest_asyncio
 from logging import StreamHandler
 from aiohttp import ClientSession, FormData
+import threading
 
 nest_asyncio.apply()
 
@@ -33,7 +34,7 @@ class TelegramLogHandler(StreamHandler):
         self.wait_time = update_interval
         self.minimum = minimum_lines
         self.pending = pending_logs
-        self.message_buffer = []  # Changed from string to list for better handling
+        self.message_buffer = []
         self.current_msg = ""
         self.floodwait = 0
         self.message_id = 0
@@ -42,34 +43,38 @@ class TelegramLogHandler(StreamHandler):
         self.base_url = f"https://api.telegram.org/bot{token}"
         DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self.initialized = False
+        self.buffer_lock = threading.Lock()  # Lock for thread-safe buffer access
 
     def emit(self, record):
         msg = self.format(record)
-        self.lines += 1
-        self.message_buffer.append(msg)  # Add to buffer list
         
-        # Check if we should send immediately due to size
-        if len('\n'.join(self.message_buffer)) >= 3000:
-            self.loop.run_until_complete(self.handle_logs(force_send=True))
-            return
+        with self.buffer_lock:
+            self.lines += 1
+            self.message_buffer.append(msg)  # Add to buffer list
             
+            # Check if we should send immediately due to size
+            if len('\n'.join(self.message_buffer)) >= 3000:
+                self.loop.run_until_complete(self.handle_logs(force_send=True))
+                return
+                
         # Check if we should send due to interval
         diff = time.time() - self.last_update
         if diff >= max(self.wait_time, self.floodwait) and self.lines >= self.minimum:
             if self.floodwait:
                 self.floodwait = 0
             self.loop.run_until_complete(self.handle_logs())
-            self.lines = 0
-            self.last_update = time.time()
+            with self.buffer_lock:
+                self.lines = 0
+                self.last_update = time.time()
 
     async def handle_logs(self, force_send=False):
-        if not self.message_buffer:
-            return
-
-        # Combine all pending messages
-        full_message = '\n'.join(self.message_buffer)
-        self.message_buffer = []  # Clear buffer immediately
-        
+        # Get the current buffer contents in a thread-safe way
+        with self.buffer_lock:
+            if not self.message_buffer:
+                return
+            full_message = '\n'.join(self.message_buffer)
+            self.message_buffer = []  # Clear buffer immediately
+            
         if not full_message.strip():
             return
 
