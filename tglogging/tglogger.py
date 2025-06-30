@@ -96,9 +96,6 @@ class TelegramLogHandler(StreamHandler):
         buffer_copy = self.message_buffer.copy()
         full_message = '\n'.join(self.message_buffer)
         
-        # Clear buffer only AFTER successful sending
-        # self.message_buffer NOT cleared here anymore
-        
         if not full_message.strip():
             return
 
@@ -110,6 +107,7 @@ class TelegramLogHandler(StreamHandler):
 
         # Start with current message and append new content
         if self.current_msg:
+            # Preserve existing header in current message
             full_message = f"{self.current_msg}\n{full_message}"
             self.current_msg = ""  # Reset after combination
 
@@ -123,16 +121,17 @@ class TelegramLogHandler(StreamHandler):
             if not chunk.strip():
                 continue
                 
+            # Add header to every chunk
+            if not chunk.startswith("k-server"):
+                chunk = f"k-server\n{chunk}"
+                
             # For the first chunk, try appending to existing message
             if i == 0 and self.message_id:
-                # Combine with existing content
-                combined_message = chunk
-                
                 # Only edit if content has changed
-                if combined_message != self.last_sent_content:
-                    chunk_success = await self.edit_message(combined_message)
+                if chunk != self.last_sent_content:
+                    chunk_success = await self.edit_message(chunk)
                     if not chunk_success:
-                        # If edit fails, try sending as new message
+                        # If edit fails, send as new message
                         chunk_success = await self.send_message(chunk)
                 else:
                     # Skip sending duplicate content
@@ -229,7 +228,7 @@ class TelegramLogHandler(StreamHandler):
 
     async def initialise(self):
         payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = "```k-server```"  # Changed from "Logging initialized"
+        payload["text"] = "```k-server```"  # Header for initial message
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
@@ -237,20 +236,21 @@ class TelegramLogHandler(StreamHandler):
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
             # Store content WITHOUT markdown formatting for state consistency
-            self.current_msg = "k-server"  # Updated text
-            self.last_sent_content = "k-server"  # Updated text
+            self.current_msg = "k-server"  # Header text
+            self.last_sent_content = "k-server"  # Header text
             return True
         return False
 
     async def send_message(self, message):
         if not message.strip():
             return False
-        
-        # Prepend "k-server" header to all new messages
-        formatted_message = f"k-server\n{message}"
+            
+        # Ensure header is present
+        if not message.startswith("k-server"):
+            message = f"k-server\n{message}"
             
         payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = f"```{formatted_message}```"
+        payload["text"] = f"```{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
@@ -258,7 +258,7 @@ class TelegramLogHandler(StreamHandler):
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
             # Store with header for consistency
-            self.last_sent_content = formatted_message
+            self.last_sent_content = message
             return True
             
         await self.handle_error(res)
@@ -267,6 +267,10 @@ class TelegramLogHandler(StreamHandler):
     async def edit_message(self, message):
         if not message.strip() or not self.message_id:
             return False
+            
+        # Ensure header is present
+        if not message.startswith("k-server"):
+            message = f"k-server\n{message}"
             
         # Don't edit if content is identical to last sent
         if message == self.last_sent_content:
