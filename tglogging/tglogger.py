@@ -92,9 +92,12 @@ class TelegramLogHandler(StreamHandler):
         if not self.message_buffer:
             return
 
-        # Combine all pending messages
+        # Save buffer content for potential re-insertion if sending fails
+        buffer_copy = self.message_buffer.copy()
         full_message = '\n'.join(self.message_buffer)
-        self.message_buffer = []  # Clear buffer immediately
+        
+        # Clear buffer only AFTER successful sending
+        # self.message_buffer NOT cleared here anymore
         
         if not full_message.strip():
             return
@@ -112,6 +115,7 @@ class TelegramLogHandler(StreamHandler):
 
         # Split into chunks that fit Telegram's limits
         chunks = self._split_into_chunks(full_message)
+        success = True
         
         # Send/update messages
         for i, chunk in enumerate(chunks):
@@ -126,22 +130,31 @@ class TelegramLogHandler(StreamHandler):
                 
                 # Only edit if content has changed
                 if combined_message != self.last_sent_content:
-                    success = await self.edit_message(combined_message)
-                    if success:
-                        self.last_sent_content = combined_message
-                    else:
-                        # If edit fails, send as new message
-                        await self.send_message(chunk)
+                    chunk_success = await self.edit_message(combined_message)
+                    if not chunk_success:
+                        # If edit fails, try sending as new message
+                        chunk_success = await self.send_message(chunk)
                 else:
                     # Skip sending duplicate content
-                    self.current_msg = chunk
+                    chunk_success = True
             else:
                 # Send new message
-                await self.send_message(chunk)
+                chunk_success = await self.send_message(chunk)
+            
+            if not chunk_success:
+                success = False
+                break
         
-        # Store the last chunk for future appends
-        if chunks:
-            self.current_msg = chunks[-1]
+        if success:
+            # Only clear buffer if ALL chunks were sent successfully
+            self.message_buffer = []
+            # Store the last chunk for future appends
+            if chunks:
+                self.current_msg = chunks[-1]
+        else:
+            # If sending failed, preserve the logs in buffer
+            # by restoring from our copy
+            self.message_buffer = buffer_copy
 
     def _split_into_chunks(self, message):
         """Split message into chunks respecting line boundaries and size limits"""
@@ -216,7 +229,7 @@ class TelegramLogHandler(StreamHandler):
 
     async def initialise(self):
         payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = "```Logging initialized```"
+        payload["text"] = "```k-server```"  # Changed from "Logging initialized"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
@@ -224,8 +237,8 @@ class TelegramLogHandler(StreamHandler):
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
             # Store content WITHOUT markdown formatting for state consistency
-            self.current_msg = "Logging initialized"
-            self.last_sent_content = "Logging initialized"
+            self.current_msg = "k-server"  # Updated text
+            self.last_sent_content = "k-server"  # Updated text
             return True
         return False
 
