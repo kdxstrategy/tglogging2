@@ -1,4 +1,3 @@
-import contextlib
 import io
 import time
 import asyncio
@@ -37,12 +36,14 @@ class TelegramLogHandler(StreamHandler):
         self.pending = pending_logs
         self.message_buffer = []
         self.floodwait = 0
+        self.message_id = 0
         self.lines = 0
         self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
         DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self.initialized = False
-
+        self.last_sent_content = ""  # Track last successfully sent content
+        
         # Register this handler
         TelegramLogHandler._handlers.add(self)
 
@@ -90,7 +91,6 @@ class TelegramLogHandler(StreamHandler):
         if not self.message_buffer:
             return
 
-        # Combine all pending messages
         full_message = '\n'.join(self.message_buffer)
         self.message_buffer = []  # Clear buffer immediately
         
@@ -103,11 +103,21 @@ class TelegramLogHandler(StreamHandler):
             if not success:
                 return
 
-        # Split into chunks and send each as a new message
-        chunks = self._split_into_chunks(full_message)
-        for chunk in chunks:
-            if chunk.strip():
-                await self.send_message(chunk)
+        # Check if we can append to the existing message
+        if self.message_id and len(self.last_sent_content + '\n' + full_message) <= 3000:
+            combined_message = self.last_sent_content + '\n' + full_message
+            success = await self.edit_message(combined_message)
+            if success:
+                self.last_sent_content = combined_message
+            else:
+                # If edit fails, send as new message
+                await self.send_message(full_message)
+        else:
+            # Send as new message(s)
+            chunks = self._split_into_chunks(full_message)
+            for chunk in chunks:
+                if chunk.strip():
+                    await self.send_message(chunk)
 
     def _split_into_chunks(self, message):
         """Split message into chunks respecting line boundaries and size limits"""
@@ -184,13 +194,32 @@ class TelegramLogHandler(StreamHandler):
 
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
+            self.message_id = res["result"]["message_id"]
+            self.last_sent_content = message
             return True
             
         await self.handle_error(res)
         return False
 
     async def edit_message(self, message):
-        # This method is retained but not used in the new approach
+        if not message.strip() or not self.message_id:
+            return False
+            
+        if message == self.last_sent_content:
+            return True
+            
+        payload = DEFAULT_PAYLOAD.copy()
+        payload["message_id"] = self.message_id
+        payload["text"] = f"```k-server\n{message}```"
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
+
+        res = await self.send_request(f"{self.base_url}/editMessageText", payload)
+        if res.get("ok"):
+            self.last_sent_content = message
+            return True
+            
+        await self.handle_error(res)
         return False
 
     async def send_as_file(self, logs):
@@ -221,10 +250,17 @@ class TelegramLogHandler(StreamHandler):
         
         if description == "message thread not found":
             print(f"Thread {self.topic_id} not found - resetting")
+            self.message_id = 0
             self.initialized = False
         elif error_code == 429:  # Too Many Requests
             retry_after = error.get("retry_after", 30)
             print(f'Floodwait: {retry_after} seconds')
             self.floodwait = retry_after
+        elif "message to edit not found" in description:
+            print("Message to edit not found - resetting")
+            self.message_id = 0
+            self.initialized = False
+        elif "message is not modified" in description:
+            print("Message not modified (no changes), skipping")
         else:
             print(f"Telegram API error: {description}")
