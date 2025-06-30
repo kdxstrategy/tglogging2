@@ -105,11 +105,10 @@ class TelegramLogHandler(StreamHandler):
             if not success:
                 return
 
-        # Start with current message and append new content
+        # Preserve existing content - don't overwrite during floodwait retries
         if self.current_msg:
-            # Preserve existing header in current message
             full_message = f"{self.current_msg}\n{full_message}"
-            self.current_msg = ""  # Reset after combination
+        self.current_msg = ""  # Reset after combination
 
         # Split into chunks that fit Telegram's limits
         chunks = self._split_into_chunks(full_message)
@@ -127,9 +126,12 @@ class TelegramLogHandler(StreamHandler):
                 
             # For the first chunk, try appending to existing message
             if i == 0 and self.message_id:
+                # Preserve existing content - don't overwrite
+                combined_message = f"{self.last_sent_content}\n{chunk}" if self.last_sent_content else chunk
+                
                 # Only edit if content has changed
-                if chunk != self.last_sent_content:
-                    chunk_success = await self.edit_message(chunk)
+                if combined_message != self.last_sent_content:
+                    chunk_success = await self.edit_message(combined_message)
                     if not chunk_success:
                         # If edit fails, send as new message
                         chunk_success = await self.send_message(chunk)
