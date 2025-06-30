@@ -8,7 +8,7 @@ from aiohttp import ClientSession, FormData
 
 nest_asyncio.apply()
 
-DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"} one message from one thread doesn't arrive after floodwait. Is it possible to check all threads if the message was send?
+DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
 class TelegramLogHandler(StreamHandler):
     """
