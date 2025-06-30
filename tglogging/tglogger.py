@@ -105,9 +105,9 @@ class TelegramLogHandler(StreamHandler):
             if not success:
                 return
 
-        # Start with current message and append new content
+        # Combine new logs with existing content
         if self.current_msg:
-            full_message = f"{self.current_msg}\n{full_message}"
+            full_message = self.current_msg + '\n' + full_message
             self.current_msg = ""  # Reset after combination
 
         # Split into chunks that fit Telegram's limits
@@ -121,14 +121,11 @@ class TelegramLogHandler(StreamHandler):
                 
             # For the first chunk, try appending to existing message
             if i == 0 and self.message_id:
-                # Combine with existing content
-                combined_message = chunk
-                
                 # Only edit if content has changed
-                if combined_message != self.last_sent_content:
-                    success = await self.edit_message(combined_message)
+                if chunk != self.last_sent_content:
+                    success = await self.edit_message(chunk)
                     if success:
-                        self.last_sent_content = combined_message
+                        self.last_sent_content = chunk
                     else:
                         # If edit fails, send as new message
                         await self.send_message(chunk)
@@ -150,31 +147,11 @@ class TelegramLogHandler(StreamHandler):
         
         # Process each line while preserving newlines
         for line in message.split('\n'):
-            # Preserve empty lines as they are part of the log format
+            # Preserve empty lines
             if line == "":
-                line = " "  # Use space to represent empty line
+                line = "\n"
             
-            # If line is too long, split it into smaller parts
-            while len(line) > 3000:
-                # Find safe split position (last space before 3000)
-                split_pos = line[:3000].rfind(' ')
-                if split_pos <= 0:
-                    split_pos = 3000  # Force split if no space found
-                part = line[:split_pos]
-                line = line[split_pos:].lstrip()
-                
-                # Add current part to chunk
-                if current_chunk:
-                    current_chunk += '\n' + part
-                else:
-                    current_chunk = part
-                    
-                # If chunk reached limit, add to chunks
-                if len(current_chunk) >= 3000:
-                    chunks.append(current_chunk)
-                    current_chunk = ""
-            
-            # Check if we can add the remaining line to current chunk
+            # Check if we can add the entire line to current chunk
             if len(current_chunk) + len(line) + 1 <= 3000:
                 if current_chunk:
                     current_chunk += '\n' + line
@@ -184,6 +161,12 @@ class TelegramLogHandler(StreamHandler):
                 if current_chunk:
                     chunks.append(current_chunk)
                 current_chunk = line
+                
+                # If a single line is too long, split it
+                while len(current_chunk) > 3000:
+                    split_pos = current_chunk[:3000].rfind(' ') or 3000
+                    chunks.append(current_chunk[:split_pos])
+                    current_chunk = current_chunk[split_pos:].lstrip()
         
         # Add remaining content
         if current_chunk:
@@ -232,6 +215,10 @@ class TelegramLogHandler(StreamHandler):
         if not message.strip():
             return False
             
+        # Handle empty message case
+        if not message:
+            message = " "
+            
         payload = DEFAULT_PAYLOAD.copy()
         payload["text"] = f"```{message}```"
         if self.topic_id:
@@ -247,8 +234,12 @@ class TelegramLogHandler(StreamHandler):
         return False
 
     async def edit_message(self, message):
-        if not message.strip() or not self.message_id:
+        if not self.message_id:
             return False
+            
+        # Handle empty message case
+        if not message:
+            message = " "
             
         # Don't edit if content is identical to last sent
         if message == self.last_sent_content:
