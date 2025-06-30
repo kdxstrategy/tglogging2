@@ -245,16 +245,20 @@ class TelegramLogHandler(StreamHandler):
     async def send_message(self, message):
         if not message.strip():
             return False
+        
+        # Prepend "k-server" header to all new messages
+        formatted_message = f"k-server\n{message}"
             
         payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = f"```{message}```"
+        payload["text"] = f"```{formatted_message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
-            self.last_sent_content = message  # Store without formatting
+            # Store with header for consistency
+            self.last_sent_content = formatted_message
             return True
             
         await self.handle_error(res)
@@ -276,7 +280,7 @@ class TelegramLogHandler(StreamHandler):
 
         res = await self.send_request(f"{self.base_url}/editMessageText", payload)
         if res.get("ok"):
-            self.last_sent_content = message  # Store without formatting
+            self.last_sent_content = message
             return True
             
         await self.handle_error(res)
