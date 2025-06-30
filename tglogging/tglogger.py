@@ -33,10 +33,10 @@ class TelegramLogHandler(StreamHandler):
         self.wait_time = update_interval
         self.minimum = minimum_lines
         self.pending = pending_logs
-        self.message_buffer = []
-        self.current_messages = {}  # {message_id: current_content}
+        self.message_buffer = []  # Changed from string to list for better handling
+        self.current_msg = ""
         self.floodwait = 0
-        self.last_message_id = 0  # ID of the most recent message
+        self.message_id = 0
         self.lines = 0
         self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
@@ -46,7 +46,7 @@ class TelegramLogHandler(StreamHandler):
     def emit(self, record):
         msg = self.format(record)
         self.lines += 1
-        self.message_buffer.append(msg)
+        self.message_buffer.append(msg)  # Add to buffer list
         
         # Check if we should send immediately due to size
         if len('\n'.join(self.message_buffer)) >= 3000:
@@ -67,10 +67,10 @@ class TelegramLogHandler(StreamHandler):
             return
 
         # Combine all pending messages
-        new_content = '\n'.join(self.message_buffer)
+        full_message = '\n'.join(self.message_buffer)
         self.message_buffer = []  # Clear buffer immediately
         
-        if not new_content.strip():
+        if not full_message.strip():
             return
 
         # Initialize if needed
@@ -79,31 +79,52 @@ class TelegramLogHandler(StreamHandler):
             if not success:
                 return
 
-        # If we have no messages yet, send the first one
-        if not self.current_messages:
-            new_msg_id = await self.send_message(new_content)
-            if new_msg_id:
-                self.current_messages[new_msg_id] = new_content
-                self.last_message_id = new_msg_id
-            return
+        # Split into chunks that fit Telegram's limits
+        chunks = self._split_into_chunks(full_message)
+        
+        # Send/update messages
+        for i, chunk in enumerate(chunks):
+            if i == 0 and self.message_id:
+                # Try to append to existing message
+                combined_message = self._combine_messages(self.current_msg, chunk)
+                success = await self.edit_message(combined_message)
+                if not success:
+                    # If edit fails, send as new message
+                    await self.send_message(chunk)
+            else:
+                # Send new message
+                await self.send_message(chunk)
+        
+        # Store the last chunk for future edits
+        self.current_msg = chunks[-1] if chunks else ""
 
-        # Get the last message to append to
-        last_msg_id = self.last_message_id
-        last_content = self.current_messages.get(last_msg_id, "")
+    def _combine_messages(self, existing_msg, new_msg):
+        """Combine existing message with new content"""
+        if not existing_msg:
+            return new_msg
+        if not new_msg:
+            return existing_msg
+        return f"{existing_msg}\n{new_msg}"
+
+    def _split_into_chunks(self, message):
+        """Split message into chunks respecting line boundaries and size limits"""
+        chunks = []
+        current_chunk = ""
         
-        # Check if we can append to last message without exceeding size limit
-        if len(last_content) + len(new_content) + 1 <= 3000:  # +1 for newline
-            updated_content = f"{last_content}\n{new_content}"
-            success = await self.edit_message(last_msg_id, updated_content)
-            if success:
-                self.current_messages[last_msg_id] = updated_content
-                return
+        for line in message.split('\n'):
+            if not line:
+                continue
+                
+            if len(current_chunk) + len(line) + 1 <= 3000:  # +1 for newline
+                current_chunk = f"{current_chunk}\n{line}" if current_chunk else line
+            else:
+                chunks.append(current_chunk)
+                current_chunk = line
         
-        # If we can't append to last message, send a new one
-        new_msg_id = await self.send_message(new_content)
-        if new_msg_id:
-            self.current_messages[new_msg_id] = new_content
-            self.last_message_id = new_msg_id
+        if current_chunk:
+            chunks.append(current_chunk)
+            
+        return chunks
 
     async def initialize_bot(self):
         """Initialize bot connection and message thread"""
@@ -112,20 +133,10 @@ class TelegramLogHandler(StreamHandler):
             print("TGLogger: [ERROR] - Invalid bot token")
             return False
             
-        # Send initial message
-        payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = "```Logging initialized```"
-        if self.topic_id:
-            payload["message_thread_id"] = self.topic_id
-
-        res = await self.send_request(f"{self.base_url}/sendMessage", payload)
-        if res.get("ok"):
-            msg_id = res["result"]["message_id"]
-            self.current_messages[msg_id] = payload["text"]
-            self.last_message_id = msg_id
+        success = await self.initialise()
+        if success:
             self.initialized = True
-            return True
-        return False
+        return success
 
     async def send_request(self, url, payload):
         async with ClientSession() as session:
@@ -138,9 +149,22 @@ class TelegramLogHandler(StreamHandler):
             return None, False
         return res.get("result", {}).get("username"), True
 
+    async def initialise(self):
+        payload = DEFAULT_PAYLOAD.copy()
+        payload["text"] = "```Logging initialized```"
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
+
+        res = await self.send_request(f"{self.base_url}/sendMessage", payload)
+        if res.get("ok"):
+            self.message_id = res["result"]["message_id"]
+            self.current_msg = payload["text"]
+            return True
+        return False
+
     async def send_message(self, message):
         if not message:
-            return None
+            return False
             
         payload = DEFAULT_PAYLOAD.copy()
         payload["text"] = f"```{message}```"
@@ -149,24 +173,25 @@ class TelegramLogHandler(StreamHandler):
 
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
-            msg_id = res["result"]["message_id"]
-            return msg_id
+            self.message_id = res["result"]["message_id"]
+            return True
             
         await self.handle_error(res)
-        return None
+        return False
 
-    async def edit_message(self, message_id, message):
-        if not message or not message_id:
+    async def edit_message(self, message):
+        if not message or not self.message_id:
             return False
             
         payload = DEFAULT_PAYLOAD.copy()
-        payload["message_id"] = message_id
+        payload["message_id"] = self.message_id
         payload["text"] = f"```{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
         res = await self.send_request(f"{self.base_url}/editMessageText", payload)
         if res.get("ok"):
+            self.current_msg = message  # Update current message with the combined content
             return True
             
         await self.handle_error(res)
@@ -200,8 +225,7 @@ class TelegramLogHandler(StreamHandler):
         
         if description == "message thread not found":
             print(f"Thread {self.topic_id} not found - resetting")
-            self.current_messages = {}
-            self.last_message_id = 0
+            self.message_id = 0
             self.initialized = False
         elif error_code == 429:  # Too Many Requests
             retry_after = error.get("retry_after", 30)
@@ -209,10 +233,7 @@ class TelegramLogHandler(StreamHandler):
             self.floodwait = retry_after
         elif "message to edit not found" in description:
             print("Message to edit not found - resetting")
-            msg_id = resp.get("parameters", {}).get("message_id")
-            if msg_id in self.current_messages:
-                del self.current_messages[msg_id]
-            if msg_id == self.last_message_id:
-                self.last_message_id = max(self.current_messages.keys(), default=0)
+            self.message_id = 0
+            self.initialized = False
         else:
             print(f"Telegram API error: {description}")
