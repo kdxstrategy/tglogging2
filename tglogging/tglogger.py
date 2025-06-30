@@ -117,9 +117,6 @@ class TelegramLogHandler(StreamHandler):
             if not force_send:
                 break
 
-    # ... (keep all other methods unchanged: send_request, verify_bot, initialise, 
-    # send_message, edit_message, send_as_file, handle_error)
-
     async def send_request(self, url, payload):
         async with ClientSession() as session:
             async with session.post(url, json=payload) as response:
@@ -140,14 +137,8 @@ class TelegramLogHandler(StreamHandler):
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
-            self.current_msg = payload["text"]
-            return True
-        return False
 
     async def send_message(self, message):
-        if not message:
-            return False
-            
         payload = DEFAULT_PAYLOAD.copy()
         payload["text"] = f"```{message}```"
         if self.topic_id:
@@ -156,32 +147,17 @@ class TelegramLogHandler(StreamHandler):
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
-            return True
-            
-        await self.handle_error(res)
-        return False
 
     async def edit_message(self, message):
-        if not message or not self.message_id:
-            return False
-            
         payload = DEFAULT_PAYLOAD.copy()
         payload["message_id"] = self.message_id
         payload["text"] = f"```{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
-        res = await self.send_request(f"{self.base_url}/editMessageText", payload)
-        if res.get("ok"):
-            return True
-            
-        await self.handle_error(res)
-        return False
+        await self.send_request(f"{self.base_url}/editMessageText", payload)
 
     async def send_as_file(self, logs):
-        if not logs:
-            return
-            
         file = io.BytesIO(logs.encode())
         file.name = "logs.txt"
         payload = DEFAULT_PAYLOAD.copy()
@@ -197,39 +173,13 @@ class TelegramLogHandler(StreamHandler):
                 data=data,
                 params=payload
             ) as response:
-                return await response.json()
+                await response.json()
 
     async def handle_error(self, resp: dict):
         error = resp.get("parameters", {})
-        error_code = resp.get("error_code")
-        description = resp.get("description", "")
-        
-        if description == "message thread not found":
+        if resp.get("description") == "message thread not found":
             print(f"Thread {self.topic_id} not found - resetting")
             self.message_id = 0
-            self.initialized = False
-        elif error_code == 429:  # Too Many Requests
-            retry_after = error.get("retry_after", 30)
-            print(f'Floodwait: {retry_after} seconds')
-            self.floodwait = retry_after
-        elif "message to edit not found" in description:
-            print("Message to edit not found - resetting")
-            self.message_id = 0
-            self.initialized = False
-        else:
-            print(f"Telegram API error: {description}")
-
-    def shutdown(self):
-        """Ensure all logs are sent before destruction"""
-        # Signal worker to process any remaining messages
-        with self.processing_lock:
-            if self.message_queue:
-                self.send_event.set()
-        
-        # Give worker time to finish
-        self.worker_thread.join(timeout=5.0)
-        
-        # Close the event loop
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        if self.loop.is_running():
-            self.loop.close()
+        elif error.get("retry_after"):
+            self.floodwait = error["retry_after"]
+            print(f'Floodwait: {self.floodwait} seconds')
