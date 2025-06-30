@@ -78,7 +78,7 @@ class TelegramLogHandler(StreamHandler):
             if not handler.message_buffer:
                 continue  # Skip handlers with empty buffers
                 
-            # Check if handler meets flush conditions
+            # Check if handler (with different topic_id) meets flush conditions
             time_diff = current_time - handler.last_update
             buffer_length = len('\n'.join(handler.message_buffer))
             if (time_diff >= max(handler.wait_time, handler.floodwait) and 
@@ -93,7 +93,7 @@ class TelegramLogHandler(StreamHandler):
         if not self.message_buffer:
             return
 
-        # Combine all pending messages without k-server header
+        # Combine all pending messages
         full_message = '\n'.join(self.message_buffer)
         self.message_buffer = []  # Clear buffer immediately
         
