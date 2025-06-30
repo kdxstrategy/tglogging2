@@ -3,7 +3,7 @@ import io
 import time
 import asyncio
 import nest_asyncio
-from logging import StreamHandler
+from logging import StreamHandler, getLogger
 from aiohttp import ClientSession, FormData
 
 nest_asyncio.apply()
@@ -12,9 +12,11 @@ DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
 class TelegramLogHandler(StreamHandler):
     """
-    Improved handler to send logs to Telegram chats with thread/topic support.
-    Preserves all messages without deletion and handles both time and size-based triggers.
+    Robust handler to send logs to Telegram chats with thread/topic support.
+    Preserves all newlines and synchronizes time checks across handlers.
     """
+
+    _last_global_update = 0  # Class variable to sync time across all handlers
 
     def __init__(
         self,
@@ -33,44 +35,56 @@ class TelegramLogHandler(StreamHandler):
         self.wait_time = update_interval
         self.minimum = minimum_lines
         self.pending = pending_logs
-        self.message_buffer = []  # Changed from string to list for better handling
+        self.message_buffer = []
         self.current_msg = ""
         self.floodwait = 0
         self.message_id = 0
         self.lines = 0
-        self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
-        DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self.initialized = False
+        self.last_edit_time = 0
+        DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
+        
+        # Register handler for global time sync
+        self._register_handler()
+
+    def _register_handler(self):
+        """Register this handler for global time synchronization"""
+        if not hasattr(TelegramLogHandler, '_active_handlers'):
+            TelegramLogHandler._active_handlers = []
+        TelegramLogHandler._active_handlers.append(self)
 
     def emit(self, record):
         msg = self.format(record)
-        self.lines += 1
-        self.message_buffer.append(msg)  # Add to buffer list
+        
+        # Preserve all newlines in the original message
+        self.lines += msg.count('\n') + 1  # Count all newlines + current line
+        self.message_buffer.append(msg)
         
         # Check if we should send immediately due to size
         if len('\n'.join(self.message_buffer)) >= 3000:
             self.loop.run_until_complete(self.handle_logs(force_send=True))
             return
             
-        # Check if we should send due to interval
-        diff = time.time() - self.last_update
-        if diff >= max(self.wait_time, self.floodwait) and self.lines >= self.minimum:
+        # Check global time sync for all handlers
+        current_time = time.time()
+        if (current_time - TelegramLogHandler._last_global_update >= self.wait_time and 
+            self.lines >= self.minimum):
             if self.floodwait:
                 self.floodwait = 0
             self.loop.run_until_complete(self.handle_logs())
             self.lines = 0
-            self.last_update = time.time()
+            TelegramLogHandler._last_global_update = current_time
 
     async def handle_logs(self, force_send=False):
         if not self.message_buffer:
             return
 
-        # Combine all pending messages
-        full_message = '\n'.join(self.message_buffer)
-        self.message_buffer = []  # Clear buffer immediately
+        # Combine all pending messages with preserved newlines
+        new_messages = '\n'.join(self.message_buffer)
+        self.message_buffer = []
         
-        if not full_message.strip():
+        if not new_messages.strip():
             return
 
         # Initialize if needed
@@ -79,34 +93,40 @@ class TelegramLogHandler(StreamHandler):
             if not success:
                 return
 
-        # Split into chunks that fit Telegram's limits
-        chunks = self._split_into_chunks(full_message)
+        # Process message chunks
+        chunks = self._split_into_chunks(new_messages)
         
-        # Send/update messages
         for i, chunk in enumerate(chunks):
             if i == 0 and self.message_id:
-                # Try to edit existing message
-                success = await self.edit_message(chunk)
-                if not success:
-                    # If edit fails, send as new message
-                    await self.send_message(chunk)
+                if chunk != self.current_msg:
+                    success = await self.edit_message(chunk)
+                    if not success:
+                        await self.send_message(chunk)
             else:
-                # Send new message
                 await self.send_message(chunk)
         
-        # Store the last chunk for future edits
         self.current_msg = chunks[-1] if chunks else ""
 
     def _split_into_chunks(self, message):
-        """Split message into chunks respecting line boundaries and size limits"""
+        """Split message into chunks while preserving all newlines"""
         chunks = []
         current_chunk = self.current_msg
         
-        for line in message.split('\n'):
+        # First try to combine with existing message
+        if current_chunk:
+            test_chunk = f"{current_chunk}\n{message}"
+            if len(test_chunk) <= 3000:
+                return [test_chunk]
+        
+        # If combination isn't possible, split into new chunks
+        lines = message.split('\n')
+        current_chunk = ""
+        
+        for line in lines:
             if not line:
                 continue
                 
-            if len(current_chunk) + len(line) + 1 <= 3000:  # +1 for newline
+            if len(current_chunk) + len(line) + 1 <= 3000:
                 current_chunk = f"{current_chunk}\n{line}" if current_chunk else line
             else:
                 chunks.append(current_chunk)
@@ -118,7 +138,6 @@ class TelegramLogHandler(StreamHandler):
         return chunks
 
     async def initialize_bot(self):
-        """Initialize bot connection and message thread"""
         uname, is_alive = await self.verify_bot()
         if not is_alive:
             print("TGLogger: [ERROR] - Invalid bot token")
@@ -165,6 +184,7 @@ class TelegramLogHandler(StreamHandler):
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
+            self.current_msg = message
             return True
             
         await self.handle_error(res)
@@ -174,6 +194,12 @@ class TelegramLogHandler(StreamHandler):
         if not message or not self.message_id:
             return False
             
+        if time.time() - self.last_edit_time < 1.0:
+            return False
+            
+        if self.current_msg == message:
+            return True
+            
         payload = DEFAULT_PAYLOAD.copy()
         payload["message_id"] = self.message_id
         payload["text"] = f"```{message}```"
@@ -182,6 +208,8 @@ class TelegramLogHandler(StreamHandler):
 
         res = await self.send_request(f"{self.base_url}/editMessageText", payload)
         if res.get("ok"):
+            self.current_msg = message
+            self.last_edit_time = time.time()
             return True
             
         await self.handle_error(res)
@@ -217,7 +245,7 @@ class TelegramLogHandler(StreamHandler):
             print(f"Thread {self.topic_id} not found - resetting")
             self.message_id = 0
             self.initialized = False
-        elif error_code == 429:  # Too Many Requests
+        elif error_code == 429:
             retry_after = error.get("retry_after", 30)
             print(f'Floodwait: {retry_after} seconds')
             self.floodwait = retry_after
@@ -227,3 +255,17 @@ class TelegramLogHandler(StreamHandler):
             self.initialized = False
         else:
             print(f"Telegram API error: {description}")
+
+    @classmethod
+    def update_all_handlers(cls):
+        """Force update all active handlers"""
+        if not hasattr(cls, '_active_handlers'):
+            return
+            
+        current_time = time.time()
+        for handler in cls._active_handlers:
+            if (current_time - cls._last_global_update >= handler.wait_time and 
+                handler.lines >= handler.minimum):
+                handler.loop.run_until_complete(handler.handle_logs())
+                handler.lines = 0
+        cls._last_global_update = current_time
