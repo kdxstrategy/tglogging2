@@ -246,7 +246,7 @@ class TelegramLogHandler(StreamHandler):
             self.message_id = 0
             self.initialized = False
         elif error_code == 429:
-            retry_after = error.get("retry_after", 30)
+            retry_after = error.get("retry_after", 5)
             print(f'Floodwait: {retry_after} seconds')
             self.floodwait = retry_after
         elif "message to edit not found" in description:
