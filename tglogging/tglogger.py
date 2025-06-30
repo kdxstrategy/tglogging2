@@ -12,11 +12,16 @@ DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
 class TelegramLogHandler(StreamHandler):
     """
-    Robust handler to send logs to Telegram chats with thread/topic support.
-    Preserves all newlines and synchronizes time checks across handlers.
+    Enhanced handler to send logs to Telegram with:
+    - Thread/topic support
+    - Floodwait recovery
+    - Message verification
+    - Persistent message tracking
+    - Automatic retries
     """
 
     _last_global_update = 0  # Class variable to sync time across all handlers
+    _active_handlers = []     # Track all active handler instances
 
     def __init__(
         self,
@@ -26,6 +31,7 @@ class TelegramLogHandler(StreamHandler):
         update_interval: int = 5,
         minimum_lines: int = 1,
         pending_logs: int = 200000,
+        max_retries: int = 3,
     ):
         StreamHandler.__init__(self)
         self.loop = asyncio.get_event_loop()
@@ -35,6 +41,7 @@ class TelegramLogHandler(StreamHandler):
         self.wait_time = update_interval
         self.minimum = minimum_lines
         self.pending = pending_logs
+        self.max_retries = max_retries
         self.message_buffer = []
         self.current_msg = ""
         self.floodwait = 0
@@ -43,30 +50,29 @@ class TelegramLogHandler(StreamHandler):
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.initialized = False
         self.last_edit_time = 0
-        DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
+        self.sent_messages = {}      # {message_id: message_content}
+        self.pending_messages = {}   # {timestamp: message_content}
+        self.retry_count = 0
         
-        # Register handler for global time sync
+        DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self._register_handler()
 
     def _register_handler(self):
         """Register this handler for global time synchronization"""
-        if not hasattr(TelegramLogHandler, '_active_handlers'):
-            TelegramLogHandler._active_handlers = []
         TelegramLogHandler._active_handlers.append(self)
 
     def emit(self, record):
         msg = self.format(record)
         
-        # Preserve all newlines in the original message
-        self.lines += msg.count('\n') + 1  # Count all newlines + current line
+        self.lines += msg.count('\n') + 1
         self.message_buffer.append(msg)
         
-        # Check if we should send immediately due to size
+        # Immediate send if buffer too large
         if len('\n'.join(self.message_buffer)) >= 3000:
             self.loop.run_until_complete(self.handle_logs(force_send=True))
             return
             
-        # Check global time sync for all handlers
+        # Global time sync check
         current_time = time.time()
         if (current_time - TelegramLogHandler._last_global_update >= self.wait_time and 
             self.lines >= self.minimum):
@@ -80,20 +86,17 @@ class TelegramLogHandler(StreamHandler):
         if not self.message_buffer:
             return
 
-        # Combine all pending messages with preserved newlines
         new_messages = '\n'.join(self.message_buffer)
         self.message_buffer = []
         
         if not new_messages.strip():
             return
 
-        # Initialize if needed
         if not self.initialized:
             success = await self.initialize_bot()
             if not success:
                 return
 
-        # Process message chunks
         chunks = self._split_into_chunks(new_messages)
         
         for i, chunk in enumerate(chunks):
@@ -101,24 +104,34 @@ class TelegramLogHandler(StreamHandler):
                 if chunk != self.current_msg:
                     success = await self.edit_message(chunk)
                     if not success:
-                        await self.send_message(chunk)
+                        await self.send_message_with_retry(chunk)
             else:
-                await self.send_message(chunk)
+                await self.send_message_with_retry(chunk)
         
         self.current_msg = chunks[-1] if chunks else ""
 
+    async def send_message_with_retry(self, message, retry_count=0):
+        """Send message with automatic retry logic"""
+        if retry_count >= self.max_retries:
+            print(f"Max retries reached for message: {message[:50]}...")
+            return False
+            
+        success = await self.send_message(message)
+        if not success:
+            await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+            return await self.send_message_with_retry(message, retry_count + 1)
+        return True
+
     def _split_into_chunks(self, message):
-        """Split message into chunks while preserving all newlines"""
+        """Split message into chunks while preserving newlines"""
         chunks = []
         current_chunk = self.current_msg
         
-        # First try to combine with existing message
         if current_chunk:
             test_chunk = f"{current_chunk}\n{message}"
             if len(test_chunk) <= 3000:
                 return [test_chunk]
         
-        # If combination isn't possible, split into new chunks
         lines = message.split('\n')
         current_chunk = ""
         
@@ -169,6 +182,7 @@ class TelegramLogHandler(StreamHandler):
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
             self.current_msg = payload["text"]
+            self.sent_messages[self.message_id] = self.current_msg
             return True
         return False
 
@@ -183,10 +197,17 @@ class TelegramLogHandler(StreamHandler):
 
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
-            self.message_id = res["result"]["message_id"]
+            message_id = res["result"]["message_id"]
+            self.message_id = message_id
             self.current_msg = message
+            self.sent_messages[message_id] = message
+            if message_id in self.pending_messages:
+                del self.pending_messages[message_id]
             return True
             
+        # If failed, add to pending messages with timestamp
+        timestamp = int(time.time() * 1000)
+        self.pending_messages[timestamp] = message
         await self.handle_error(res)
         return False
 
@@ -210,9 +231,39 @@ class TelegramLogHandler(StreamHandler):
         if res.get("ok"):
             self.current_msg = message
             self.last_edit_time = time.time()
+            self.sent_messages[self.message_id] = message
             return True
             
         await self.handle_error(res)
+        return False
+
+    async def verify_message_delivery(self, message_id=None):
+        """Verify if messages were actually delivered"""
+        if message_id:
+            payload = DEFAULT_PAYLOAD.copy()
+            payload["message_id"] = message_id
+            res = await self.send_request(f"{self.base_url}/getMessage", payload)
+            if res.get("ok"):
+                return True
+            return await self.resend_message(message_id)
+        else:
+            success = True
+            for msg_id, msg_content in list(self.sent_messages.items()):
+                if not await self.verify_message_delivery(msg_id):
+                    success = False
+            for timestamp, msg_content in list(self.pending_messages.items()):
+                if await self.send_message_with_retry(msg_content):
+                    success = success and True
+                else:
+                    success = False
+            return success
+
+    async def resend_message(self, message_id):
+        """Resend a message if verification fails"""
+        if message_id in self.sent_messages:
+            content = self.sent_messages[message_id]
+            del self.sent_messages[message_id]
+            return await self.send_message_with_retry(content)
         return False
 
     async def send_as_file(self, logs):
@@ -234,7 +285,10 @@ class TelegramLogHandler(StreamHandler):
                 data=data,
                 params=payload
             ) as response:
-                await response.json()
+                res = await response.json()
+                if res.get("ok"):
+                    self.message_id = res["result"]["message_id"]
+                return res
 
     async def handle_error(self, resp: dict):
         error = resp.get("parameters", {})
@@ -249,6 +303,8 @@ class TelegramLogHandler(StreamHandler):
             retry_after = error.get("retry_after", 30)
             print(f'Floodwait: {retry_after} seconds')
             self.floodwait = retry_after
+            await asyncio.sleep(retry_after)
+            await self.verify_message_delivery()
         elif "message to edit not found" in description:
             print("Message to edit not found - resetting")
             self.message_id = 0
@@ -259,9 +315,6 @@ class TelegramLogHandler(StreamHandler):
     @classmethod
     def update_all_handlers(cls):
         """Force update all active handlers"""
-        if not hasattr(cls, '_active_handlers'):
-            return
-            
         current_time = time.time()
         for handler in cls._active_handlers:
             if (current_time - cls._last_global_update >= handler.wait_time and 
@@ -269,3 +322,9 @@ class TelegramLogHandler(StreamHandler):
                 handler.loop.run_until_complete(handler.handle_logs())
                 handler.lines = 0
         cls._last_global_update = current_time
+
+    @classmethod
+    async def verify_all_handlers(cls):
+        """Verify messages for all active handlers"""
+        for handler in cls._active_handlers:
+            await handler.verify_message_delivery()
