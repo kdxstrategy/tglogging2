@@ -93,9 +93,8 @@ class TelegramLogHandler(StreamHandler):
         if not self.message_buffer:
             return
 
-        # Combine all pending messages with k-server header
+        # Combine all pending messages without k-server header
         full_message = '\n'.join(self.message_buffer)
-        full_message = f"k-server\n{full_message}"
         self.message_buffer = []  # Clear buffer immediately
         
         if not full_message.strip():
@@ -220,8 +219,8 @@ class TelegramLogHandler(StreamHandler):
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
-            self.current_msg = "k-server\nLogging initialized"
-            self.last_sent_content = "k-server\nLogging initialized"
+            self.current_msg = "Logging initialized"
+            self.last_sent_content = "Logging initialized"
             return True
         return False
 
@@ -230,7 +229,7 @@ class TelegramLogHandler(StreamHandler):
             return False
             
         payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = f"```{message}```"
+        payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
@@ -252,7 +251,7 @@ class TelegramLogHandler(StreamHandler):
             
         payload = DEFAULT_PAYLOAD.copy()
         payload["message_id"] = self.message_id
-        payload["text"] = f"```{message}```"
+        payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
@@ -268,10 +267,10 @@ class TelegramLogHandler(StreamHandler):
         if not logs:
             return
             
-        file = io.BytesIO(logs.encode())
+        file = io.BytesIO(f"k-server\n{logs}".encode())
         file.name = "logs.txt"
         payload = DEFAULT_PAYLOAD.copy()
-        payload["caption"] = "k-server\nLogs (too large for message)"
+        payload["caption"] = "```k-server\nLogs (too large for message)```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
