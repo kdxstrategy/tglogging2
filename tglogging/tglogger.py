@@ -120,14 +120,14 @@ class TelegramLogHandler(StreamHandler):
             if not chunk.strip():
                 continue
                 
-            # Add header to every chunk
-            if not chunk.startswith("k-server"):
-                chunk = f"k-server\n{chunk}"
-                
             # For the first chunk, try appending to existing message
             if i == 0 and self.message_id:
-                # Preserve existing content - don't overwrite
-                combined_message = f"{self.last_sent_content}\n{chunk}" if self.last_sent_content else chunk
+                # Only combine with existing content if we have it
+                if self.last_sent_content:
+                    # Preserve existing content and append new logs
+                    combined_message = f"{self.last_sent_content}\n{chunk}"
+                else:
+                    combined_message = chunk
                 
                 # Only edit if content has changed
                 if combined_message != self.last_sent_content:
@@ -154,7 +154,6 @@ class TelegramLogHandler(StreamHandler):
                 self.current_msg = chunks[-1]
         else:
             # If sending failed, preserve the logs in buffer
-            # by restoring from our copy
             self.message_buffer = buffer_copy
 
     def _split_into_chunks(self, message):
@@ -247,7 +246,7 @@ class TelegramLogHandler(StreamHandler):
         if not message.strip():
             return False
             
-        # Ensure header is present
+        # Add header only for new messages
         if not message.startswith("k-server"):
             message = f"k-server\n{message}"
             
@@ -259,7 +258,7 @@ class TelegramLogHandler(StreamHandler):
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
-            # Store with header for consistency
+            # Store without formatting for consistency
             self.last_sent_content = message
             return True
             
@@ -269,10 +268,6 @@ class TelegramLogHandler(StreamHandler):
     async def edit_message(self, message):
         if not message.strip() or not self.message_id:
             return False
-            
-        # Ensure header is present
-        if not message.startswith("k-server"):
-            message = f"k-server\n{message}"
             
         # Don't edit if content is identical to last sent
         if message == self.last_sent_content:
