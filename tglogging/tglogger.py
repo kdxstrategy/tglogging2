@@ -270,18 +270,26 @@ class TelegramLogHandler(StreamHandler):
             print(f"Telegram API error: {description}")
 
     def flush_and_close(self):
-        """Отправить все логи и корректно закрыть loop"""
+        """Отправить все логи и корректно закрыть loop (с ретраями по 3 секунды)"""
         async def _final_flush():
-            if self.message_buffer:
-                await self.handle_logs(force_send=True)
+            retries = 0
+            while self.message_buffer:
+                try:
+                    await self.handle_logs(force_send=True)
+                    if not self.message_buffer:
+                        break
+                except Exception as e:
+                    print(f"TGLogger flush error: {e}, retrying in 3s...")
+                    await asyncio.sleep(3)
+                retries += 1
             self._stop_event.set()
 
         if self.loop and self.loop.is_running():
             fut = asyncio.run_coroutine_threadsafe(_final_flush(), self.loop)
             try:
-                fut.result(timeout=5)  # ждём максимум 5 сек
+                fut.result(timeout=30)  # ждём максимум 30 сек
             except Exception as e:
-                print(f"Flush error: {e}")
+                print(f"Flush final error: {e}")
             self.loop.call_soon_threadsafe(self.loop.stop)
 
     def __del__(self):
