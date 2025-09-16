@@ -1,18 +1,20 @@
 import io
 import time
 import asyncio
-import threading
+import nest_asyncio
 import weakref
 from logging import StreamHandler
 from aiohttp import ClientSession, FormData
+
+nest_asyncio.apply()
 
 DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
 
 class TelegramLogHandler(StreamHandler):
     """
-    Синхронный логгер с накоплением буфера.
-    Логи копятся, а отдельная задача отправляет их каждые update_interval секунд.
+    Handler для отправки логов в Telegram.
+    Логи копятся и отправляются автоматически, даже после floodwait.
     """
     _handlers = weakref.WeakSet()
 
@@ -25,8 +27,8 @@ class TelegramLogHandler(StreamHandler):
         minimum_lines: int = 1,
         pending_logs: int = 200000,
     ):
-        super().__init__()
-        self.loop = asyncio.new_event_loop()
+        StreamHandler.__init__(self)
+        self.loop = asyncio.get_event_loop()
         self.token = token
         self.log_chat_id = int(log_chat_id)
         self.topic_id = int(topic_id) if topic_id else None
@@ -39,23 +41,15 @@ class TelegramLogHandler(StreamHandler):
         self.lines = 0
         self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
+        DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self.initialized = False
         self.last_sent_content = ""
         self._handlers.add(self)
 
-        DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
-
-        # 🚀 Запускаем отдельный поток с asyncio loop
-        t = threading.Thread(target=self._run_loop, daemon=True)
-        t.start()
-
-    def _run_loop(self):
-        asyncio.set_event_loop(self.loop)
+        # Запускаем фонового воркера
         self.loop.create_task(self._background_worker())
-        self.loop.run_forever()
 
     def emit(self, record):
-        """Кладём сообщение в буфер"""
         msg = self.format(record)
         self.lines += 1
         self.message_buffer.append(msg)
@@ -64,9 +58,11 @@ class TelegramLogHandler(StreamHandler):
         """Фоновая задача — проверяет буфер и отправляет логи"""
         while True:
             try:
-                if (
+                if self.floodwait > 0:
+                    # уменьшаем floodwait и ждём
+                    self.floodwait -= 1
+                elif (
                     self.message_buffer
-                    and not self.floodwait
                     and (
                         time.time() - self.last_update >= self.wait_time
                         or self.lines >= self.minimum
@@ -84,7 +80,7 @@ class TelegramLogHandler(StreamHandler):
         if not self.message_buffer or self.floodwait:
             return
 
-        full_message = "\n".join(self.message_buffer)
+        full_message = '\n'.join(self.message_buffer)
         if not full_message.strip():
             return
 
@@ -94,8 +90,9 @@ class TelegramLogHandler(StreamHandler):
                 return
 
         sent_success = False
-        if self.message_id and len(self.last_sent_content + "\n" + full_message) <= 4096:
-            combined_message = self.last_sent_content + "\n" + full_message
+
+        if self.message_id and len(self.last_sent_content + '\n' + full_message) <= 4096:
+            combined_message = self.last_sent_content + '\n' + full_message
             sent_success = await self.edit_message(combined_message)
             if sent_success:
                 self.last_sent_content = combined_message
@@ -111,35 +108,43 @@ class TelegramLogHandler(StreamHandler):
             self.message_buffer.clear()
 
     def _split_into_chunks(self, message):
-        chunks, current_chunk = [], ""
-        lines = message.split("\n")
+        chunks = []
+        current_chunk = ""
+        lines = message.split('\n')
+
         for line in lines:
             if line == "":
                 line = " "
+
             while len(line) > 4096:
-                split_pos = line[:4096].rfind(" ")
+                split_pos = line[:4096].rfind(' ')
                 if split_pos <= 0:
                     split_pos = 4096
                 part = line[:split_pos]
                 line = line[split_pos:].lstrip()
+
                 if current_chunk:
-                    current_chunk += "\n" + part
+                    current_chunk += '\n' + part
                 else:
                     current_chunk = part
+
                 if len(current_chunk) >= 4096:
                     chunks.append(current_chunk)
                     current_chunk = ""
+
             if len(current_chunk) + len(line) + 1 <= 4096:
                 if current_chunk:
-                    current_chunk += "\n" + line
+                    current_chunk += '\n' + line
                 else:
                     current_chunk = line
             else:
                 if current_chunk:
                     chunks.append(current_chunk)
                 current_chunk = line
+
         if current_chunk:
             chunks.append(current_chunk)
+
         return chunks
 
     async def initialize_bot(self):
@@ -164,49 +169,60 @@ class TelegramLogHandler(StreamHandler):
     async def send_message(self, message):
         if not message.strip():
             return False
+
         payload = DEFAULT_PAYLOAD.copy()
         payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
+
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
             self.last_sent_content = message
             return True
+
         await self.handle_error(res)
         return False
 
     async def edit_message(self, message):
         if not message.strip() or not self.message_id:
             return False
+
         if message == self.last_sent_content:
             return True
+
         payload = DEFAULT_PAYLOAD.copy()
         payload["message_id"] = self.message_id
         payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
+
         res = await self.send_request(f"{self.base_url}/editMessageText", payload)
         if res.get("ok"):
             self.last_sent_content = message
             return True
+
         await self.handle_error(res)
         return False
 
     async def send_as_file(self, logs):
         if not logs:
             return
+
         file = io.BytesIO(f"k-server\n{logs}".encode())
         file.name = "logs.txt"
         payload = DEFAULT_PAYLOAD.copy()
         payload["caption"] = "```k-server\nLogs (too large for message)```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
+
         async with ClientSession() as session:
             data = FormData()
-            data.add_field("document", file, filename="logs.txt")
+            data.add_field('document', file, filename='logs.txt')
             async with session.post(
-                f"{self.base_url}/sendDocument", data=data, params=payload
+                f"{self.base_url}/sendDocument",
+                data=data,
+                params=payload
             ) as response:
                 await response.json()
 
@@ -214,13 +230,14 @@ class TelegramLogHandler(StreamHandler):
         error = resp.get("parameters", {})
         error_code = resp.get("error_code")
         description = resp.get("description", "")
+
         if description == "message thread not found":
             print(f"Thread {self.topic_id} not found - resetting")
             self.message_id = 0
             self.initialized = False
         elif error_code == 429:
             retry_after = error.get("retry_after", 30)
-            print(f"Floodwait: {retry_after} seconds")
+            print(f'Floodwait: {retry_after} seconds')
             self.floodwait = retry_after
         elif "message to edit not found" in description:
             print("Message to edit not found - resetting")
