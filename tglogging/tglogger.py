@@ -14,9 +14,8 @@ DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 class TelegramLogHandler(StreamHandler):
     """
     Improved handler to send logs to Telegram chats with thread/topic support.
-    Each topic has its own buffer and message state.
+    Preserves all messages during floodwait and appends new logs to previous message when possible.
     """
-
     _handlers = weakref.WeakSet()  # Registry of all active handlers
 
     def __init__(
@@ -36,71 +35,61 @@ class TelegramLogHandler(StreamHandler):
         self.wait_time = update_interval
         self.minimum = minimum_lines
         self.pending = pending_logs
-
-        # Buffers and states per topic
-        self.message_buffers = {}        # topic_id -> list of log lines
-        self.message_ids = {}            # topic_id -> last message_id
-        self.last_sent_contents = {}     # topic_id -> last content sent
-        self.lines = {}                  # topic_id -> line counter
-        self.last_update = {}            # topic_id -> last send time
-
+        self.message_buffer = []
         self.floodwait = 0
+        self.message_id = 0
+        self.lines = 0
+        self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
         DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self.initialized = False
-
+        self.last_sent_content = ""  # Track last successfully sent content
         self._handlers.add(self)
-
-    def _get_topic(self):
-        return self.topic_id or 0  # Use 0 as default key if no topic_id
 
     def emit(self, record):
         msg = self.format(record)
-        topic = self._get_topic()
+        self.lines += 1
+        self.message_buffer.append(msg)
 
-        buf = self.message_buffers.setdefault(topic, [])
-        buf.append(msg)
-        self.lines[topic] = self.lines.get(topic, 0) + 1
+        current_length = len('\n'.join(self.message_buffer))
+        now = time.time()
 
-        # Check if need to send due to size
-        current_length = len("\n".join(buf))
+        # Отправка по размеру
         if current_length >= 3000 and not self.floodwait:
-            self.loop.run_until_complete(self.handle_logs(topic, force_send=True))
-            self.lines[topic] = 0
-            self.last_update[topic] = time.time()
+            self.loop.run_until_complete(self.handle_logs(force_send=True))
+            self.lines = 0
+            self.last_update = now
 
-        # Check if need to send due to interval
-        diff = time.time() - self.last_update.get(topic, 0)
-        if diff >= max(self.wait_time, self.floodwait) and self.lines[topic] >= self.minimum:
+        # Отправка по времени
+        diff = now - self.last_update
+        if diff >= max(self.wait_time, self.floodwait) and self.lines >= self.minimum:
             if self.floodwait:
                 self.floodwait = 0
-            self.loop.run_until_complete(self.handle_logs(topic))
-            self.lines[topic] = 0
-            self.last_update[topic] = time.time()
+            self.loop.run_until_complete(self.handle_logs())
+            self.lines = 0
+            self.last_update = now
 
-        # Also check other handlers' topics
-        current_time = time.time()
+        # Проверяем все остальные хендлеры (чтобы очереди не застаивались)
         for handler in TelegramLogHandler._handlers:
-            for t, b in list(handler.message_buffers.items()):
-                if not b:
-                    continue
-                time_diff = current_time - handler.last_update.get(t, 0)
-                buffer_length = len("\n".join(b))
-                if (time_diff >= max(handler.wait_time, handler.floodwait)
-                        and handler.lines.get(t, 0) >= handler.minimum) or buffer_length >= 3000:
-                    if handler.floodwait:
-                        handler.floodwait = 0
-                    handler.loop.run_until_complete(handler.handle_logs(t))
-                    handler.lines[t] = 0
-                    handler.last_update[t] = current_time
+            if handler is self or not handler.message_buffer:
+                continue
 
-    async def handle_logs(self, topic, force_send=False):
-        buf = self.message_buffers.get(topic, [])
-        if not buf or self.floodwait:
+            buffer_len = len('\n'.join(handler.message_buffer))
+            time_diff = now - handler.last_update
+            if (time_diff >= max(handler.wait_time, handler.floodwait) and
+                handler.lines >= handler.minimum) or buffer_len >= 3000:
+                if handler.floodwait:
+                    handler.floodwait = 0
+                handler.loop.run_until_complete(handler.handle_logs())
+                handler.lines = 0
+                handler.last_update = now
+
+    async def handle_logs(self, force_send=False):
+        if not self.message_buffer or self.floodwait:
             return
 
-        full_message = "\n".join(buf)
-        self.message_buffers[topic] = []  # Clear after copy
+        full_message = '\n'.join(self.message_buffer)
+        self.message_buffer = []  # очищаем только тут
 
         if not full_message.strip():
             return
@@ -108,58 +97,48 @@ class TelegramLogHandler(StreamHandler):
         if not self.initialized:
             success = await self.initialize_bot()
             if not success:
-                self.message_buffers[topic] = [full_message]  # restore
+                self.message_buffer = [full_message]
                 return
 
-        last_content = self.last_sent_contents.get(topic, "")
-        msg_id = self.message_ids.get(topic)
-
-        # Try edit message
-        if msg_id and len(last_content + "\n" + full_message) <= 4096:
-            combined_message = last_content + "\n" + full_message
-            success = await self.edit_message(topic, combined_message)
+        # Если можем редактировать предыдущее сообщение
+        if self.message_id and len(self.last_sent_content + '\n' + full_message) <= 4096:
+            combined = self.last_sent_content + '\n' + full_message
+            success = await self.edit_message(combined)
             if success:
-                self.last_sent_contents[topic] = combined_message
+                self.last_sent_content = combined
             else:
-                await self.send_message(topic, full_message)
+                await self.send_message(full_message)
         else:
-            # Send new message(s)
+            # Отправляем чанками
             chunks = self._split_into_chunks(full_message)
             for chunk in chunks:
                 if chunk.strip():
-                    await self.send_message(topic, chunk)
+                    await self.send_message(chunk)
 
     def _split_into_chunks(self, message):
         chunks = []
         current_chunk = ""
-        lines = message.split("\n")
-
-        for line in lines:
+        for line in message.split('\n'):
             if line == "":
                 line = " "
             while len(line) > 4096:
-                split_pos = line[:4096].rfind(" ")
+                split_pos = line[:4096].rfind(' ')
                 if split_pos <= 0:
                     split_pos = 4096
                 part = line[:split_pos]
                 line = line[split_pos:].lstrip()
                 if current_chunk:
-                    current_chunk += "\n" + part
+                    current_chunk += '\n' + part
                 else:
                     current_chunk = part
                 if len(current_chunk) >= 4096:
                     chunks.append(current_chunk)
                     current_chunk = ""
             if len(current_chunk) + len(line) + 1 <= 4096:
-                if current_chunk:
-                    current_chunk += "\n" + line
-                else:
-                    current_chunk = line
+                current_chunk += ('\n' if current_chunk else '') + line
             else:
-                if current_chunk:
-                    chunks.append(current_chunk)
+                chunks.append(current_chunk)
                 current_chunk = line
-
         if current_chunk:
             chunks.append(current_chunk)
         return chunks
@@ -174,13 +153,13 @@ class TelegramLogHandler(StreamHandler):
 
     async def send_request(self, url, payload):
         try:
-            timeout = ClientTimeout(total=15)
+            timeout = ClientTimeout(total=10)  # чтобы не вис на timeout
             async with ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload) as response:
                     return await response.json()
-        except asyncio.TimeoutError:
-            print("TGLogger: Connection timeout")
-            return {"ok": False, "description": "Connection timeout"}
+        except Exception as e:
+            print(f"TGLogger: request failed: {e}")
+            return {"ok": False}
 
     async def verify_bot(self):
         res = await self.send_request(f"{self.base_url}/getMe", {})
@@ -188,85 +167,79 @@ class TelegramLogHandler(StreamHandler):
             return None, False
         return res.get("result", {}).get("username"), True
 
-    async def send_message(self, topic, message):
+    async def send_message(self, message):
         if not message.strip():
             return False
-
         payload = DEFAULT_PAYLOAD.copy()
         payload["text"] = f"```k-server\n{message}```"
-        if topic:
-            payload["message_thread_id"] = topic
-
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
         res = await self.send_request(f"{self.base_url}/sendMessage", payload)
         if res.get("ok"):
-            self.message_ids[topic] = res["result"]["message_id"]
-            self.last_sent_contents[topic] = message
+            self.message_id = res["result"]["message_id"]
+            self.last_sent_content = message
             return True
-
-        await self.handle_error(topic, res)
+        await self.handle_error(res)
         return False
 
-    async def edit_message(self, topic, message):
-        if not message.strip():
+    async def edit_message(self, message):
+        if not message.strip() or not self.message_id:
             return False
-        msg_id = self.message_ids.get(topic)
-        if not msg_id:
-            return False
-        if message == self.last_sent_contents.get(topic, ""):
+        if message == self.last_sent_content:
             return True
-
         payload = DEFAULT_PAYLOAD.copy()
-        payload["message_id"] = msg_id
+        payload["message_id"] = self.message_id
         payload["text"] = f"```k-server\n{message}```"
-        if topic:
-            payload["message_thread_id"] = topic
-
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
         res = await self.send_request(f"{self.base_url}/editMessageText", payload)
         if res.get("ok"):
-            self.last_sent_contents[topic] = message
+            self.last_sent_content = message
             return True
-
-        await self.handle_error(topic, res)
+        await self.handle_error(res)
         return False
 
-    async def send_as_file(self, topic, logs):
+    async def send_as_file(self, logs):
         if not logs:
             return
-
         file = io.BytesIO(f"k-server\n{logs}".encode())
         file.name = "logs.txt"
         payload = DEFAULT_PAYLOAD.copy()
         payload["caption"] = "```k-server\nLogs (too large for message)```"
-        if topic:
-            payload["message_thread_id"] = topic
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
+        try:
+            timeout = ClientTimeout(total=15)
+            async with ClientSession(timeout=timeout) as session:
+                data = FormData()
+                data.add_field('document', file, filename='logs.txt')
+                async with session.post(
+                    f"{self.base_url}/sendDocument",
+                    data=data,
+                    params=payload
+                ) as response:
+                    await response.json()
+        except Exception as e:
+            print(f"TGLogger: send_as_file failed: {e}")
 
-        timeout = ClientTimeout(total=30)
-        async with ClientSession(timeout=timeout) as session:
-            data = FormData()
-            data.add_field("document", file, filename="logs.txt")
-            async with session.post(
-                f"{self.base_url}/sendDocument", data=data, params=payload
-            ) as response:
-                await response.json()
-
-    async def handle_error(self, topic, resp: dict):
+    async def handle_error(self, resp: dict):
         error = resp.get("parameters", {})
         error_code = resp.get("error_code")
         description = resp.get("description", "")
-
         if description == "message thread not found":
-            print(f"Thread {topic} not found - resetting")
-            self.message_ids[topic] = 0
+            print(f"Thread {self.topic_id} not found - resetting")
+            self.message_id = 0
             self.initialized = False
-        elif error_code == 429:  # Too Many Requests
+        elif error_code == 429:
             retry_after = error.get("retry_after", 30)
-            print(f"Floodwait: {retry_after} seconds")
+            print(f'Floodwait: {retry_after} seconds')
             self.floodwait = retry_after
         elif "message to edit not found" in description:
             print("Message to edit not found - resetting")
-            self.message_ids[topic] = 0
+            self.message_id = 0
             self.initialized = False
         elif "message is not modified" in description:
-            print("Message not modified (no changes), skipping")
-        elif description:
-            print(f"Telegram API error: {description}")
+            pass  # не критично
+        else:
+            if description:
+                print(f"Telegram API error: {description}")
