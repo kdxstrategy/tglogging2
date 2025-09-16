@@ -19,28 +19,25 @@ class TelegramLogHandler(StreamHandler):
     def __init__(
         self,
         token: str,
-        log_chat_id: int,
-        topic_id: int = None,
-        update_interval: int = 5,
+        chats: list[tuple[int, int | None]],  # [(chat_id, topic_id), ...]
+        flush_interval: float = 1.0,
         minimum_lines: int = 1,
-        pending_logs: int = 200000,
     ):
+        """
+        :param token: Telegram bot token
+        :param chats: список [(chat_id, topic_id), ...]
+        :param flush_interval: как часто проверять буферы (сек)
+        :param minimum_lines: минимальное число строк для отправки
+        """
         super().__init__()
         self.token = token
-        self.log_chat_id = int(log_chat_id)
-        self.default_topic_id = int(topic_id) if topic_id else None
-        self.wait_time = update_interval
+        self.chats = [(int(cid), int(tid) if tid else None) for cid, tid in chats]
+        self.flush_interval = flush_interval
         self.minimum = minimum_lines
-        self.pending = pending_logs
-
-        # буферы на каждый topic
-        self.buffers: dict[int | None, dict] = {}
-        # состояние по каждому topic
-        self.last_sent: dict[int | None, str] = {}
-        self.message_ids: dict[int | None, int] = {}
-        self.floodwait = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
-        self.initialized = False
+
+        # отдельные буферы для каждого (chat, topic)
+        self.buffers = {(cid, tid): [] for cid, tid in self.chats}
 
         self._handlers.add(self)
 
@@ -51,10 +48,12 @@ class TelegramLogHandler(StreamHandler):
             self._start_worker()
             TelegramLogHandler._worker_started = True
 
+    # ---------------- Worker init ----------------
     def _start_worker(self):
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self._worker())
+            loop.create_task(self._flusher())
             print("[TGLogger] Worker attached to existing loop")
         except RuntimeError:
             TelegramLogHandler._loop = asyncio.new_event_loop()
@@ -62,6 +61,7 @@ class TelegramLogHandler(StreamHandler):
             def run_loop(loop):
                 asyncio.set_event_loop(loop)
                 loop.create_task(self._worker())
+                loop.create_task(self._flusher())
                 loop.run_forever()
 
             TelegramLogHandler._thread = threading.Thread(
@@ -69,27 +69,6 @@ class TelegramLogHandler(StreamHandler):
             )
             TelegramLogHandler._thread.start()
             print("[TGLogger] Worker running in background thread")
-
-    def emit(self, record):
-        msg = self.format(record)
-        topic = self.default_topic_id
-        buf = self.buffers.setdefault(
-            topic, {"messages": [], "lines": 0, "last_update": 0}
-        )
-
-        buf["messages"].append(msg)
-        buf["lines"] += 1
-        now = time.time()
-
-        buffer_text = "\n".join(buf["messages"])
-        if (
-            len(buffer_text) >= 3000
-            or (now - buf["last_update"] >= self.wait_time and buf["lines"] >= self.minimum)
-        ):
-            self._enqueue((self, topic, buffer_text))
-            buf["messages"] = []
-            buf["lines"] = 0
-            buf["last_update"] = now
 
     def _enqueue(self, item):
         try:
@@ -101,43 +80,38 @@ class TelegramLogHandler(StreamHandler):
                     asyncio.create_task, TelegramLogHandler._queue.put(item)
                 )
 
+    # ---------------- Logging ----------------
+    def emit(self, record):
+        msg = self.format(record)
+        for key in self.buffers:
+            self.buffers[key].append(msg)
+
+    async def _flusher(self):
+        """Периодически сбрасывает буферы"""
+        while True:
+            await asyncio.sleep(self.flush_interval)
+            for key, buf in self.buffers.items():
+                if len(buf) >= self.minimum:
+                    payload = "\n".join(buf)
+                    self.buffers[key] = []
+                    self._enqueue((self, key, payload))
+
     async def _worker(self):
         while True:
-            handler, topic, message = await TelegramLogHandler._queue.get()
+            handler, key, message = await TelegramLogHandler._queue.get()
             try:
-                await handler.handle_logs(topic, message)
+                await handler.handle_logs(key, message)
             except Exception as e:
                 print(f"[TGLogger] Worker error: {e}")
-                await asyncio.sleep(5)
-                handler._enqueue((handler, topic, message))
+                await asyncio.sleep(2)
+                handler._enqueue((handler, key, message))
 
-    async def handle_logs(self, topic_id: int | None, full_message: str):
-        if not full_message.strip() or self.floodwait:
-            await asyncio.sleep(self.floodwait or 1)
-            self._enqueue((self, topic_id, full_message))
-            return
-
-        if not self.initialized:
-            success = await self.initialize_bot()
-            if not success:
-                self._enqueue((self, topic_id, full_message))
-                return
-
-        last_sent = self.last_sent.get(topic_id, "")
-        message_id = self.message_ids.get(topic_id, 0)
-
-        if message_id and len(last_sent + "\n" + full_message) <= 4096:
-            combined_message = last_sent + "\n" + full_message
-            success = await self.edit_message(topic_id, message_id, combined_message)
-            if success:
-                self.last_sent[topic_id] = combined_message
-                return
-
+    # ---------------- Send to Telegram ----------------
+    async def handle_logs(self, key, full_message: str):
+        chat_id, topic_id = key
         for chunk in self._split_into_chunks(full_message):
             if chunk.strip():
-                ok = await self.send_message(topic_id, chunk)
-                if not ok:
-                    self._enqueue((self, topic_id, chunk))
+                await self._send_message(chat_id, topic_id, chunk)
 
     def _split_into_chunks(self, message: str):
         chunks, current_chunk = [], ""
@@ -166,87 +140,25 @@ class TelegramLogHandler(StreamHandler):
             chunks.append(current_chunk)
         return chunks
 
-    async def initialize_bot(self):
-        uname, is_alive = await self.verify_bot()
-        if not is_alive:
-            print("[TGLogger] Invalid bot token")
-            return False
-        self.initialized = True
-        return True
+    async def _send_message(self, chat_id, topic_id, message):
+        payload = DEFAULT_PAYLOAD.copy()
+        payload["chat_id"] = chat_id
+        payload["text"] = f"```logs\n{message}```"
+        if topic_id:
+            payload["message_thread_id"] = topic_id
+        res = await self._send_request(f"{self.base_url}/sendMessage", payload)
+        if not res.get("ok"):
+            print(f"[TGLogger] Error sending to {chat_id}/{topic_id}: {res}")
 
-    async def send_request(self, url, payload):
+    async def _send_request(self, url, payload):
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload) as response:
                     return await response.json()
         except (asyncio.TimeoutError, ClientConnectorError, ServerTimeoutError) as e:
-            print(f"[TGLogger] Timeout: {e}")
-            return {"ok": False, "description": str(e)}
+            return {"ok": False, "description": f"Timeout {e}"}
         except ClientError as e:
-            print(f"[TGLogger] Aiohttp error: {e}")
-            return {"ok": False, "description": str(e)}
+            return {"ok": False, "description": f"ClientError {e}"}
         except Exception as e:
-            print(f"[TGLogger] Unexpected error: {e}")
-            return {"ok": False, "description": str(e)}
-
-    async def verify_bot(self):
-        res = await self.send_request(f"{self.base_url}/getMe", {})
-        if res.get("error_code") == 401:
-            return None, False
-        return res.get("result", {}).get("username"), True
-
-    async def send_message(self, topic_id, message):
-        payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = f"```k-server\n{message}```"
-        payload["chat_id"] = self.log_chat_id
-        if topic_id:
-            payload["message_thread_id"] = topic_id
-
-        res = await self.send_request(f"{self.base_url}/sendMessage", payload)
-        if res.get("ok"):
-            self.message_ids[topic_id] = res["result"]["message_id"]
-            self.last_sent[topic_id] = message
-            return True
-        await self.handle_error(res, topic_id, message)
-        return False
-
-    async def edit_message(self, topic_id, message_id, message):
-        payload = DEFAULT_PAYLOAD.copy()
-        payload["message_id"] = message_id
-        payload["text"] = f"```k-server\n{message}```"
-        payload["chat_id"] = self.log_chat_id
-        if topic_id:
-            payload["message_thread_id"] = topic_id
-
-        res = await self.send_request(f"{self.base_url}/editMessageText", payload)
-        if res.get("ok"):
-            self.last_sent[topic_id] = message
-            return True
-        await self.handle_error(res, topic_id, message)
-        return False
-
-    async def handle_error(self, resp: dict, topic_id, failed_message: str = None):
-        error = resp.get("parameters", {})
-        error_code = resp.get("error_code")
-        description = resp.get("description", "")
-
-        if error_code == 429:
-            retry_after = error.get("retry_after", 30)
-            print(f"[TGLogger] Floodwait {retry_after}s")
-            self.floodwait = retry_after
-            if failed_message:
-                await asyncio.sleep(retry_after)
-                self._enqueue((self, topic_id, failed_message))
-        elif "not found" in description.lower():
-            print("[TGLogger] Message/thread not found — resetting")
-            self.message_ids[topic_id] = 0
-            self.initialized = False
-            if failed_message:
-                self._enqueue((self, topic_id, failed_message))
-        elif "not modified" in description.lower():
-            print("[TGLogger] Message not modified, skipping")
-        else:
-            print(f"[TGLogger] API error: {description}")
-            if failed_message:
-                self._enqueue((self, topic_id, failed_message))
+            return {"ok": False, "description": f"Unexpected {e}"}
