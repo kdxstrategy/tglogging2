@@ -14,6 +14,8 @@ class TelegramLogHandler(StreamHandler):
     _handlers = weakref.WeakSet()
     _worker_started = False
     _queue = None
+    _loop = None  # отдельный event loop (если sync-код)
+    _thread = None
 
     def __init__(
         self,
@@ -43,22 +45,33 @@ class TelegramLogHandler(StreamHandler):
 
         self._handlers.add(self)
 
-        # глобальная очередь
         if TelegramLogHandler._queue is None:
             TelegramLogHandler._queue = asyncio.Queue()
 
-        # запуск воркера (и цикла, если он ещё не существует)
         if not TelegramLogHandler._worker_started:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                threading.Thread(target=loop.run_forever, daemon=True).start()
-            else:
-                pass
-            loop.create_task(self._worker())
+            self._start_worker()
             TelegramLogHandler._worker_started = True
+
+    def _start_worker(self):
+        """Запускаем воркер в существующем или отдельном event loop"""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._worker())
+            print("[TGLogger] Worker attached to existing loop")
+        except RuntimeError:
+            # если event loop не запущен (синхронный код) — поднимаем свой в потоке
+            TelegramLogHandler._loop = asyncio.new_event_loop()
+
+            def run_loop(loop):
+                asyncio.set_event_loop(loop)
+                loop.create_task(self._worker())
+                loop.run_forever()
+
+            TelegramLogHandler._thread = threading.Thread(
+                target=run_loop, args=(TelegramLogHandler._loop,), daemon=True
+            )
+            TelegramLogHandler._thread.start()
+            print("[TGLogger] Worker running in background thread")
 
     def emit(self, record):
         msg = self.format(record)
@@ -71,34 +84,43 @@ class TelegramLogHandler(StreamHandler):
             len(buffer_text) >= 3000
             or (now - self.last_update >= self.wait_time and self.lines >= self.minimum)
         ):
-            # отправляем весь буфер одним куском
-            asyncio.create_task(TelegramLogHandler._queue.put((self, buffer_text)))
+            self._enqueue((self, buffer_text))
             self.message_buffer = []
             self.lines = 0
             self.last_update = now
 
+    def _enqueue(self, item):
+        """Добавляем задачу в очередь (работает и в sync, и в async)"""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(TelegramLogHandler._queue.put(item))
+        except RuntimeError:
+            # если мы в синхронном коде — кладём через loop.call_soon_threadsafe
+            if TelegramLogHandler._loop:
+                TelegramLogHandler._loop.call_soon_threadsafe(
+                    asyncio.create_task, TelegramLogHandler._queue.put(item)
+                )
+
     async def _worker(self):
-        """Фоновая задача, которая обрабатывает очередь"""
         while True:
             handler, message = await TelegramLogHandler._queue.get()
             try:
                 await handler.handle_logs(message)
             except Exception as e:
                 print(f"[TGLogger] Worker error: {e}")
-                # возвращаем в очередь, чтобы не потерялось
-                await TelegramLogHandler._queue.put((handler, message))
                 await asyncio.sleep(5)
+                handler._enqueue((handler, message))
 
     async def handle_logs(self, full_message: str):
         if not full_message.strip() or self.floodwait:
             await asyncio.sleep(self.floodwait or 1)
-            await TelegramLogHandler._queue.put((self, full_message))
+            self._enqueue((self, full_message))
             return
 
         if not self.initialized:
             success = await self.initialize_bot()
             if not success:
-                await TelegramLogHandler._queue.put((self, full_message))
+                self._enqueue((self, full_message))
                 return
 
         if self.message_id and len(self.last_sent_content + "\n" + full_message) <= 4096:
@@ -108,12 +130,11 @@ class TelegramLogHandler(StreamHandler):
                 self.last_sent_content = combined_message
                 return
 
-        # иначе отправляем чанками
         for chunk in self._split_into_chunks(full_message):
             if chunk.strip():
                 ok = await self.send_message(chunk)
                 if not ok:
-                    await TelegramLogHandler._queue.put((self, chunk))
+                    self._enqueue((self, chunk))
 
     def _split_into_chunks(self, message: str):
         chunks, current_chunk = [], ""
@@ -215,16 +236,16 @@ class TelegramLogHandler(StreamHandler):
             self.floodwait = retry_after
             if failed_message:
                 await asyncio.sleep(retry_after)
-                await TelegramLogHandler._queue.put((self, failed_message))
+                self._enqueue((self, failed_message))
         elif "not found" in description.lower():
             print("[TGLogger] Message/thread not found — resetting")
             self.message_id = 0
             self.initialized = False
             if failed_message:
-                await TelegramLogHandler._queue.put((self, failed_message))
+                self._enqueue((self, failed_message))
         elif "not modified" in description.lower():
             print("[TGLogger] Message not modified, skipping")
         else:
             print(f"[TGLogger] API error: {description}")
             if failed_message:
-                await TelegramLogHandler._queue.put((self, failed_message))
+                self._enqueue((self, failed_message))
