@@ -5,10 +5,9 @@ import nest_asyncio
 import weakref
 import threading
 from logging import StreamHandler
-from typing import Optional, Dict, List
-from aiohttp import ClientSession, FormData, ClientTimeout, ClientError
+from typing import Optional, Dict, List, Tuple
+from aiohttp import ClientSession, ClientTimeout, ClientError, FormData
 
-# allow nested loops in interactive/debug environments
 nest_asyncio.apply()
 
 DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
@@ -16,324 +15,343 @@ DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
 class TelegramLogHandler(StreamHandler):
     """
-    Telegram log handler:
-      - per-topic buffers, per-topic message_id and last_sent
+    TelegramLogHandler:
+      - per-handler per-topic buffers
       - background event loop + shared aiohttp session
-      - automatic periodic flusher (sends without external trigger)
-      - non-blocking for sync code (emit only enqueues + schedules)
-      - requeues on timeout/errors (no logs lost)
+      - periodic flusher sending accumulated chunks without external trigger
+      - non-blocking for synchronous code
+      - requeues on network/timeouts so logs aren't lost
+      - edits last message when possible (doesn't overwrite older messages)
     """
 
-    # shared class-level bg loop, thread, session and registry
+    # class-level shared resources
     _handlers = weakref.WeakSet()
     _bg_loop: Optional[asyncio.AbstractEventLoop] = None
     _bg_thread: Optional[threading.Thread] = None
     _session: Optional[ClientSession] = None
-    _session_lock = threading.Lock()
+    _flusher_task_name = "_tglog_flusher_task"
 
     def __init__(
         self,
         token: str,
         log_chat_id: int,
         topic_id: Optional[int] = None,
-        update_interval: int = 5,
+        update_interval: float = 5.0,
         minimum_lines: int = 1,
         pending_logs: int = 200000,
         request_timeout: int = 10,
     ):
         super().__init__()
-        # runtime / config
+        # config
         self.token = token
         self.log_chat_id = int(log_chat_id)
-        self.default_topic = int(topic_id) if topic_id is not None else 0
+        self.topic_id = int(topic_id) if topic_id is not None else None
         self.update_interval = float(update_interval)
         self.minimum = int(minimum_lines)
         self.pending = int(pending_logs)
         self.request_timeout = int(request_timeout)
 
-        # per-topic buffers & states
-        # keys: topic id (int)
-        self._buffers: Dict[int, List[str]] = {}
-        self._message_ids: Dict[int, int] = {}
-        self._last_sent: Dict[int, str] = {}
-        self._lines: Dict[int, int] = {}
-        self._last_update: Dict[int, float] = {}
-
-        # other
+        # per-handler state
+        # buffer is list of strings representing lines to send for this handler/topic
+        self._buffer: List[str] = []
+        # last sent message id and content (we only edit the last message)
+        self._last_message: Optional[Tuple[int, str]] = None
+        # floodwait seconds if set by Telegram
         self.floodwait = 0
-        self.base_url = f"https://api.telegram.org/bot{self.token}"
-        self.initialized = False
+        # bookkeeping
+        self._lines = 0
+        self._last_update = 0.0
+        self._initialized = False
 
-        # thread lock for buffers
+        # internal lock for thread-safety between emit() and bg loop
         self._lock = threading.Lock()
 
-        # register
+        # base url for this bot
+        self._base_url = f"https://api.telegram.org/bot{self.token}"
+
+        # register handler globally
         TelegramLogHandler._handlers.add(self)
 
-        # ensure bg loop + session + flusher running
-        self._ensure_bg_loop_running()
-        # schedule session creation & flusher in bg loop
-        self._schedule_bg_task(self._bg_init())
+        # ensure background loop + session + flusher are running
+        self._ensure_bg_loop()
+        # schedule session creation + flusher start on bg loop
+        self._run_in_bg(self._ensure_session_and_flusher())
 
-    # ---------------------------
-    # Background loop & session
-    # ---------------------------
+    # ------------------------
+    # background loop helpers
+    # ------------------------
     @classmethod
-    def _start_bg_loop(cls):
+    def _start_bg_thread(cls):
         if cls._bg_loop is not None and cls._bg_loop.is_running():
             return
 
-        def thread_target():
+        def _thread_main():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             cls._bg_loop = loop
             loop.run_forever()
 
-        t = threading.Thread(target=thread_target, name="tglog-bg-loop", daemon=True)
+        t = threading.Thread(target=_thread_main, name="tglog-bg-loop", daemon=True)
         t.start()
         cls._bg_thread = t
-        # wait until bg_loop is set
+        # wait until loop is available
         while cls._bg_loop is None:
             time.sleep(0.01)
 
-    def _ensure_bg_loop_running(self):
+    def _ensure_bg_loop(self):
         if TelegramLogHandler._bg_loop is None or not TelegramLogHandler._bg_loop.is_running():
-            TelegramLogHandler._start_bg_loop()
+            TelegramLogHandler._start_bg_thread()
 
-    @classmethod
-    async def _ensure_session(cls, timeout_seconds: int):
-        """Ensure shared aiohttp session exists (must be called inside bg loop or app loop)."""
-        if cls._session is None or cls._session.closed:
-            cls._session = ClientSession(timeout=ClientTimeout(total=timeout_seconds))
-
-    async def _bg_init(self):
-        """Create session and start flusher coroutine on bg loop."""
-        # ensure session exists on this loop
-        await TelegramLogHandler._ensure_session(self.request_timeout)
-        # start periodic flusher if not already scheduled
-        # We schedule a single flusher task on the bg loop (runs forever)
-        # Use attribute on class to avoid duplicate tasks per handler
-        if not hasattr(TelegramLogHandler, "_flusher_task"):
-            TelegramLogHandler._flusher_task = asyncio.create_task(self._flusher_loop())
-
-    # ---------------------------
-    # Scheduling helper
-    # ---------------------------
-    def _schedule_bg_task(self, coro: asyncio.coroutines):
-        """Run a coroutine in the bg loop (non-blocking)."""
-        self._ensure_bg_loop_running()
-        assert TelegramLogHandler._bg_loop is not None
-        return asyncio.run_coroutine_threadsafe(coro, TelegramLogHandler._bg_loop)
-
-    def _maybe_create_task_in_running_loop(self, coro: asyncio.coroutines):
+    def _run_in_bg(self, coro: asyncio.coroutines):
         """
-        If current thread has running loop, use create_task there (async apps).
-        Otherwise schedule in bg loop via run_coroutine_threadsafe (sync apps).
+        Schedule coroutine on the background loop (non-blocking).
+        If current thread has a running loop, prefer creating a task there (for async apps).
         """
         try:
             loop = asyncio.get_running_loop()
-            # if loop running in this thread, schedule there
-            if loop.is_running():
-                return loop.create_task(coro)
         except RuntimeError:
-            pass
-        # otherwise use bg loop
-        return self._schedule_bg_task(coro)
+            loop = None
 
-    # ---------------------------
-    # Emit -> enqueue only (non-blocking)
-    # ---------------------------
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-        except Exception:
-            # avoid raising during emit
-            return
+        if loop and loop.is_running():
+            # Running inside an async app: schedule here
+            return loop.create_task(coro)
+        else:
+            assert TelegramLogHandler._bg_loop is not None
+            return asyncio.run_coroutine_threadsafe(coro, TelegramLogHandler._bg_loop)
 
-        topic = self.default_topic
-        now = time.time()
+    # ------------------------
+    # session + flusher
+    # ------------------------
+    @classmethod
+    async def _ensure_session(cls, timeout_seconds: int):
+        if cls._session is None or cls._session.closed:
+            cls._session = ClientSession(timeout=ClientTimeout(total=timeout_seconds))
 
-        with self._lock:
-            buf = self._buffers.setdefault(topic, [])
-            buf.append(msg)
-            self._lines[topic] = self._lines.get(topic, 0) + 1
-            self._last_update.setdefault(topic, now)
-            buffer_text = "\n".join(buf)
-            buffer_len = len(buffer_text)
+    async def _ensure_session_and_flusher(self):
+        # ensure session exists in bg loop
+        await TelegramLogHandler._ensure_session(self.request_timeout)
+        # start flusher once (on bg loop)
+        if not hasattr(TelegramLogHandler, TelegramLogHandler._flusher_task_name):
+            # create flusher task bound to bg loop
+            task = asyncio.create_task(self._flusher_loop())
+            setattr(TelegramLogHandler, TelegramLogHandler._flusher_task_name, task)
 
-        # If buffer big — schedule immediate send
-        if buffer_len >= 3000 and not self.floodwait:
-            self._maybe_create_task_in_running_loop(self._handle_topic_send(topic, force_send=True))
-            with self._lock:
-                self._lines[topic] = 0
-                self._last_update[topic] = now
-            # also check other handlers
-            self._schedule_check_other_handlers()
-            return
-
-        # If enough lines — send
-        if self._lines.get(topic, 0) >= self.minimum:
-            self._maybe_create_task_in_running_loop(self._handle_topic_send(topic))
-            with self._lock:
-                self._lines[topic] = 0
-                self._last_update[topic] = now
-            self._schedule_check_other_handlers()
-            return
-
-        # else: nothing immediate; flusher will pick it up later
-        self._schedule_check_other_handlers()
-
-    def _schedule_check_other_handlers(self):
-        # quickly schedule a check that will flush other handlers if needed
-        # run in bg loop (non-blocking)
-        self._schedule_bg_task(self._check_all_handlers_once())
-
-    async def _check_all_handlers_once(self):
-        now = time.time()
-        for handler in list(TelegramLogHandler._handlers):
-            try:
-                with handler._lock:
-                    for topic, buf in list(handler._buffers.items()):
-                        if not buf:
-                            continue
-                        text = "\n".join(buf)
-                        length = len(text)
-                        last = handler._last_update.get(topic, 0)
-                        if length >= 3000 or (now - last >= handler.update_interval and handler._lines.get(topic, 0) >= handler.minimum):
-                            # schedule send for that handler/topic
-                            asyncio.create_task(handler._handle_topic_send(topic))
-                            handler._lines[topic] = 0
-                            handler._last_update[topic] = now
-            except Exception:
-                # ignore handler errors during scheduling
-                continue
-
-    # ---------------------------
-    # Periodic flusher (runs on bg loop)
-    # ---------------------------
     async def _flusher_loop(self):
+        """Periodically check all handlers and flush ready buffers."""
         while True:
             try:
-                await asyncio.sleep( max(0.5, self.update_interval/2) )
+                await asyncio.sleep(max(0.5, self.update_interval / 2.0))
                 now = time.time()
-                # iterate handlers and topics
+                # iterate over copy of handlers
                 for handler in list(TelegramLogHandler._handlers):
                     try:
+                        # decide per-handler per-topic
                         with handler._lock:
-                            for topic, buf in list(handler._buffers.items()):
-                                if not buf:
-                                    continue
-                                last = handler._last_update.get(topic, 0)
-                                # if buffer aged enough or size big, schedule send
-                                if len("\n".join(buf)) >= 3000 or (now - last >= handler.update_interval and handler._lines.get(topic, 0) >= handler.minimum):
-                                    asyncio.create_task(handler._handle_topic_send(topic))
-                                    handler._lines[topic] = 0
-                                    handler._last_update[topic] = now
+                            if not handler._buffer:
+                                continue
+                            buf_text = "\n".join(handler._buffer)
+                            buf_len = len(buf_text)
+                            time_diff = now - handler._last_update
+                            if buf_len >= 3000 or (time_diff >= max(handler.update_interval, handler.floodwait) and handler._lines >= handler.minimum):
+                                # schedule immediate send for that handler
+                                asyncio.create_task(handler._handle_send())  # runs in this loop
+                                handler._lines = 0
+                                handler._last_update = now
                     except Exception:
+                        # swallow individual handler errors to keep flusher alive
                         continue
             except asyncio.CancelledError:
                 break
             except Exception:
-                # swallow exceptions to keep flusher running
+                # swallow and wait a bit, keep flusher alive
                 await asyncio.sleep(1)
 
-    # ---------------------------
-    # Core topic send logic
-    # ---------------------------
-    async def _handle_topic_send(self, topic: int, force_send: bool = False):
-        """
-        Sends buffered logs for the given topic.
-        If sending fails, requeues data to buffer for later retries.
-        Runs in an event loop (bg loop or app loop).
-        """
-        # snapshot and clear buffer atomically
+    # ------------------------
+    # emit (non-blocking)
+    # ------------------------
+    def emit(self, record):
+        """Non-blocking: just append to buffer and schedule send checks."""
+        try:
+            msg = self.format(record)
+        except Exception:
+            # avoid raising from emit
+            return
+
+        now = time.time()
         with self._lock:
-            buf = self._buffers.get(topic, [])
-            if not buf:
+            self._buffer.append(msg)
+            self._lines += 1
+            self._last_update = self._last_update or now
+
+        # If large buffer or enough lines, schedule send in appropriate loop
+        # If running inside an async app, schedule there; otherwise schedule in bg loop.
+        # Also schedule checks for other handlers so they don't pile up.
+        if len("\n".join(self._buffer)) >= 3000 and not self.floodwait:
+            # immediate attempt
+            self._maybe_schedule_send(self._handle_send(force_send=True))
+            with self._lock:
+                self._lines = 0
+                self._last_update = now
+            # also check other handlers
+            self._run_in_bg(self._check_other_handlers_once())
+            return
+
+        if self._lines >= self.minimum and (time.time() - self._last_update) >= 0:
+            self._maybe_schedule_send(self._handle_send())
+            with self._lock:
+                self._lines = 0
+                self._last_update = now
+            self._run_in_bg(self._check_other_handlers_once())
+            return
+
+        # schedule a lightweight check for other handlers (non-blocking)
+        self._run_in_bg(self._check_other_handlers_once())
+
+    def _maybe_schedule_send(self, coro):
+        """Schedule coro on running loop if present, otherwise on bg loop."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            loop.create_task(coro)
+        else:
+            self._run_in_bg(coro)
+
+    async def _check_other_handlers_once(self):
+        """Inspect all handlers and schedule sends where needed (called in bg loop)."""
+        now = time.time()
+        for handler in list(TelegramLogHandler._handlers):
+            try:
+                with handler._lock:
+                    if not handler._buffer:
+                        continue
+                    buf_text = "\n".join(handler._buffer)
+                    buf_len = len(buf_text)
+                    last = handler._last_update or 0
+                    if buf_len >= 3000 or (now - last >= handler.update_interval and handler._lines >= handler.minimum):
+                        asyncio.create_task(handler._handle_send())
+                        handler._lines = 0
+                        handler._last_update = now
+            except Exception:
+                continue
+
+    # ------------------------
+    # core send logic
+    # ------------------------
+    async def _handle_send(self, force_send: bool = False):
+        """
+        Send buffered data for this handler/topic.
+        On failure (timeout, network error), requeue the chunk(s) back to buffer.
+        """
+        # quick check
+        with self._lock:
+            if not self._buffer or self.floodwait:
                 return
-            full_message = "\n".join(buf)
-            # clear buffer now; on failure we'll push back
-            self._buffers[topic] = []
-            self._lines[topic] = 0
+            full_message = "\n".join(self._buffer)
+            # snapshot and clear buffer — we'll requeue on failure
+            self._buffer = []
+            self._lines = 0
 
         if not full_message.strip():
             return
 
-        # ensure session available in this loop
+        # ensure session exists in current loop
         try:
             await TelegramLogHandler._ensure_session(self.request_timeout)
         except Exception:
-            # session creation failure -> requeue and return
+            # session not ready: requeue and return
             with self._lock:
-                self._buffers.setdefault(topic, []).insert(0, full_message)
-                self._lines[topic] = self._lines.get(topic, 0) + 1
+                self._buffer.insert(0, full_message)
+                self._lines = self._lines + full_message.count("\n") + 1
             return
 
-        # initialize bot if needed (verify)
-        if not self.initialized:
+        # initialize bot (verify) if needed
+        if not self._initialized:
             ok = await self._verify_bot_once()
             if not ok:
-                # restore
+                # requeue and return
                 with self._lock:
-                    self._buffers.setdefault(topic, []).insert(0, full_message)
-                    self._lines[topic] = self._lines.get(topic, 0) + 1
+                    self._buffer.insert(0, full_message)
+                    self._lines = self._lines + full_message.count("\n") + 1
                 return
 
-        # try to append to existing message if possible
-        last_text = self._last_sent.get(topic, "")
-        mid = self._message_ids.get(topic)
-        try:
-            if mid and len(last_text + "\n" + full_message) <= 4096:
-                ok = await self._edit_message_request(topic, mid, last_text + "\n" + full_message)
+        # try to append to last message if possible
+        last_msg = self._last_message  # (message_id, content) or None
+        if last_msg:
+            last_id, last_content = last_msg
+            if len(last_content + "\n" + full_message) <= 4096:
+                ok = await self._edit_message(last_id, last_content + "\n" + full_message)
                 if ok:
-                    self._last_sent[topic] = last_text + "\n" + full_message
+                    # update last content
+                    self._last_message = (last_id, last_content + "\n" + full_message)
+                    # also try to flush other handlers — schedule check
+                    await self._schedule_flush_all()
                     return
-                # else fall through to send new chunks
-        except Exception:
-            # on unexpected error, requeue and return
-            with self._lock:
-                self._buffers.setdefault(topic, []).insert(0, full_message)
-                self._lines[topic] = self._lines.get(topic, 0) + 1
-            return
+                # fallthrough to send as new chunks
 
-        # send as new messages split into chunks
+        # send as new message(s) chunked
         chunks = self._split_into_chunks(full_message)
         for idx, chunk in enumerate(chunks):
             if not chunk.strip():
                 continue
-            ok = await self._send_message_request(topic, chunk)
+            ok, msg_id = await self._send_message(chunk)
             if not ok:
-                # requeue remaining (including this chunk)
+                # requeue this chunk and remaining ones at front (preserve order)
                 with self._lock:
-                    # push current chunk and remaining chunks to front
-                    self._buffers.setdefault(topic, []).insert(0, chunk)
-                    for rem in reversed(chunks[idx+1:]):
-                        self._buffers[topic].insert(0, rem)
-                    self._lines[topic] = self._lines.get(topic, 0) + 1
+                    # insert remaining in reverse so they come out in correct order
+                    for r in reversed(chunks[idx:]):
+                        self._buffer.insert(0, r)
+                    self._lines = self._lines + full_message.count("\n") + 1
                 return
+            # success: store last message id/content (only of the latest chunk we sent)
+            self._last_message = (msg_id, chunk)
 
-    # ---------------------------
-    # HTTP helpers (shared session)
-    # ---------------------------
-    async def _send_request(self, url: str, *, json_payload=None, data=None, params=None):
+        # after finishing sending for this handler, ensure other handlers are flushed too
+        await self._schedule_flush_all()
+
+    async def _schedule_flush_all(self):
+        """
+        When one handler finishes sending, check all other handlers and schedule sends for them
+        (ensures when sending to one topic we also flush others).
+        """
+        # run check in bg loop to avoid blocking
+        await self._check_other_handlers_once()
+
+    # ------------------------
+    # HTTP helpers
+    # ------------------------
+    async def _send_request(self, path: str, json_payload=None, data=None, params=None) -> Tuple[bool, dict]:
+        """
+        Perform POST request using shared session; returns (ok_flag, response_json_or_empty).
+        This must be called from a running loop that has access to TelegramLogHandler._session
+        (we ensured session is created on bg loop at startup).
+        """
         sess = TelegramLogHandler._session
         if sess is None:
-            # try to ensure session on this loop
             try:
                 await TelegramLogHandler._ensure_session(self.request_timeout)
                 sess = TelegramLogHandler._session
             except Exception:
                 return False, {}
 
+        url = f"{self._base_url}/{path.lstrip('/')}"
         try:
             if json_payload is not None:
                 async with sess.post(url, json=json_payload) as resp:
-                    res = await resp.json()
-                    return res.get("ok", False), res
+                    try:
+                        res = await resp.json()
+                        return res.get("ok", False), res
+                    except Exception:
+                        return False, {}
             else:
                 async with sess.post(url, data=data, params=params) as resp:
-                    res = await resp.json()
-                    return res.get("ok", False), res
+                    try:
+                        res = await resp.json()
+                        return res.get("ok", False), res
+                    except Exception:
+                        return False, {}
         except asyncio.TimeoutError:
             return False, {"ok": False, "description": "timeout"}
         except ClientError as e:
@@ -341,92 +359,78 @@ class TelegramLogHandler(StreamHandler):
         except Exception as e:
             return False, {"ok": False, "description": str(e)}
 
-    async def _send_message_request(self, topic: int, message: str) -> bool:
+    async def _send_message(self, text: str) -> Tuple[bool, Optional[int]]:
         payload = DEFAULT_PAYLOAD.copy()
         payload["chat_id"] = self.log_chat_id
-        payload["text"] = f"```k-server\n{message}```"
-        if topic:
-            payload["message_thread_id"] = topic
-        ok, res = await self._send_request(f"{self.base_url}/sendMessage", json_payload=payload)
+        payload["text"] = f"```k-server\n{text}```"
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
+        ok, res = await self._send_request("sendMessage", json_payload=payload)
         if ok:
-            mid = res["result"]["message_id"]
-            self._message_ids[topic] = mid
-            self._last_sent[topic] = message
-            return True
-        await self._handle_error(topic, res)
-        return False
+            try:
+                mid = res["result"]["message_id"]
+                return True, mid
+            except Exception:
+                return False, None
+        # handle error (may set floodwait)
+        await self._handle_api_error(res)
+        return False, None
 
-    async def _edit_message_request(self, topic: int, message_id: int, message: str) -> bool:
+    async def _edit_message(self, message_id: int, new_text: str) -> bool:
         payload = DEFAULT_PAYLOAD.copy()
         payload["chat_id"] = self.log_chat_id
         payload["message_id"] = message_id
-        payload["text"] = f"```k-server\n{message}```"
-        if topic:
-            payload["message_thread_id"] = topic
-        ok, res = await self._send_request(f"{self.base_url}/editMessageText", json_payload=payload)
+        payload["text"] = f"```k-server\n{new_text}```"
+        if self.topic_id:
+            payload["message_thread_id"] = self.topic_id
+        ok, res = await self._send_request("editMessageText", json_payload=payload)
         if ok:
-            self._last_sent[topic] = message
             return True
-        await self._handle_error(topic, res)
+        await self._handle_api_error(res)
         return False
 
-    # ---------------------------
-    # Verify / initialize
-    # ---------------------------
     async def _verify_bot_once(self) -> bool:
-        ok, res = await self._send_request(f"{self.base_url}/getMe", json_payload={})
+        ok, res = await self._send_request("getMe", json_payload={})
         if not ok:
             return False
-        # mark initialized
-        self.initialized = True
+        self._initialized = True
         return True
 
-    # ---------------------------
-    # Error handling
-    # ---------------------------
-    async def _handle_error(self, topic: int, resp: dict):
-        params = resp.get("parameters", {}) or {}
-        code = resp.get("error_code")
-        desc = resp.get("description", "") or ""
-        if desc == "message thread not found":
-            self._message_ids.pop(topic, None)
-            self._last_sent.pop(topic, None)
-            self.initialized = False
-            return
+    async def _handle_api_error(self, res: dict):
+        params = res.get("parameters", {}) or {}
+        code = res.get("error_code")
+        desc = res.get("description", "") or ""
         if code == 429:
             retry_after = int(params.get("retry_after", 30))
             self.floodwait = retry_after
-            return
-        if "message to edit not found" in desc:
-            self._message_ids.pop(topic, None)
-            self._last_sent.pop(topic, None)
-            self.initialized = False
-            return
-        # network timeouts etc. will be indicated by description; do nothing else
+        elif desc == "message thread not found":
+            # thread/topic invalid: reset last message state so next send creates new message
+            self._last_message = None
+            self._initialized = False
+        elif "message to edit not found" in desc:
+            self._last_message = None
+            self._initialized = False
+        # other errors: nothing special (timeouts are handled in _send_request)
 
-    # ---------------------------
-    # Chunking utility
-    # ---------------------------
+    # ------------------------
+    # chunking utility
+    # ------------------------
     def _split_into_chunks(self, message: str) -> List[str]:
         chunks: List[str] = []
         current = ""
         for line in message.split("\n"):
             if line == "":
                 line = " "
+            # split extremely long lines into segments
             while len(line) > 4096:
-                split_pos = line[:4096].rfind(" ")
-                if split_pos <= 0:
-                    split_pos = 4096
-                part = line[:split_pos]
-                line = line[split_pos:].lstrip()
+                part = line[:4096]
+                line = line[4096:]
                 if current:
-                    current += "\n" + part
-                else:
-                    current = part
-                if len(current) >= 4096:
                     chunks.append(current)
-                    current = ""
-            if len(current) + len(line) + 1 <= 4096:
+                    current = part
+                else:
+                    chunks.append(part)
+            if len(current) + len(line) + (1 if current else 0) <= 4096:
                 current = (current + "\n" + line) if current else line
             else:
                 if current:
@@ -436,37 +440,43 @@ class TelegramLogHandler(StreamHandler):
             chunks.append(current)
         return chunks
 
-    # ---------------------------
-    # Helpers: flush and close
-    # ---------------------------
-    def flush_all(self):
-        """Schedule flush of all handlers (non-blocking)."""
-        self._schedule_bg_task(self._check_all_handlers_once())
+    # ------------------------
+    # public helpers
+    # ------------------------
+    def flush(self):
+        """Request immediate flush of this handler's buffer (non-blocking)."""
+        self._maybe_schedule_send(self._handle_send())
+
+    @classmethod
+    def flush_all(cls):
+        """Non-blocking flush request for all handlers."""
+        for handler in list(cls._handlers):
+            handler.flush()
 
     @classmethod
     def close(cls):
-        """Close bg session and stop flusher (best-effort)."""
+        """Close background session and stop flusher (best-effort)."""
+        # cancel flusher task
         if cls._bg_loop is None:
             return
 
-        async def _close_all():
-            # cancel flusher if present
-            task = getattr(TelegramLogHandler, "_flusher_task", None)
+        async def _shutdown():
+            task = getattr(TelegramLogHandler, TelegramLogHandler._flusher_task_name, None)
             if task:
                 task.cancel()
                 try:
                     await task
                 except Exception:
                     pass
-                TelegramLogHandler._flusher_task = None
+                delattr(TelegramLogHandler, TelegramLogHandler._flusher_task_name)
             if cls._session and not cls._session.closed:
                 await cls._session.close()
                 cls._session = None
 
-        fut = asyncio.run_coroutine_threadsafe(_close_all(), cls._bg_loop)
+        fut = asyncio.run_coroutine_threadsafe(_shutdown(), TelegramLogHandler._bg_loop)
         try:
             fut.result(timeout=5)
         except Exception:
             pass
 
-# end of class
+# End of class
