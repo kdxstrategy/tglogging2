@@ -5,7 +5,7 @@ import nest_asyncio
 import weakref
 import threading
 from logging import StreamHandler
-from aiohttp import ClientSession, FormData
+from aiohttp import ClientSession, FormData, ClientTimeout
 
 nest_asyncio.apply()
 
@@ -164,7 +164,8 @@ class TelegramLogHandler(StreamHandler):
         return True
 
     async def send_request(self, url, payload):
-        async with ClientSession() as session:
+        timeout = ClientTimeout(total=3)  # таймаут 3 секунды
+        async with ClientSession(timeout=timeout) as session:
             async with session.post(url, json=payload) as response:
                 return await response.json()
 
@@ -224,7 +225,8 @@ class TelegramLogHandler(StreamHandler):
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
 
-        async with ClientSession() as session:
+        timeout = ClientTimeout(total=3)  # таймаут 3 секунды
+        async with ClientSession(timeout=timeout) as session:
             data = FormData()
             data.add_field('document', file, filename='logs.txt')
             async with session.post(
