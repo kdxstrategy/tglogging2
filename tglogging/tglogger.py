@@ -3,6 +3,7 @@ import time
 import asyncio
 import nest_asyncio
 import weakref
+import threading
 from logging import StreamHandler
 from aiohttp import ClientSession, FormData
 
@@ -13,7 +14,7 @@ DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
 class TelegramLogHandler(StreamHandler):
     """
-    Handler для отправки логов в Telegram.
+    Handler для отправки логов в Telegram (синхронный код).
     Логи копятся и отправляются автоматически, даже после floodwait.
     """
     _handlers = weakref.WeakSet()
@@ -28,7 +29,6 @@ class TelegramLogHandler(StreamHandler):
         pending_logs: int = 200000,
     ):
         StreamHandler.__init__(self)
-        self.loop = asyncio.get_event_loop()
         self.token = token
         self.log_chat_id = int(log_chat_id)
         self.topic_id = int(topic_id) if topic_id else None
@@ -46,8 +46,17 @@ class TelegramLogHandler(StreamHandler):
         self.last_sent_content = ""
         self._handlers.add(self)
 
-        # Запускаем фонового воркера
-        self.loop.create_task(self._background_worker())
+        # создаём отдельный event loop в отдельном потоке
+        self.loop = asyncio.new_event_loop()
+        t = threading.Thread(target=self._run_loop, daemon=True)
+        t.start()
+
+        # запускаем воркер внутри этого event loop
+        asyncio.run_coroutine_threadsafe(self._background_worker(), self.loop)
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
 
     def emit(self, record):
         msg = self.format(record)
@@ -59,7 +68,7 @@ class TelegramLogHandler(StreamHandler):
         while True:
             try:
                 if self.floodwait > 0:
-                    # уменьшаем floodwait и ждём
+                    print(f"[TGLogger] floodwait: {self.floodwait} сек")
                     self.floodwait -= 1
                 elif (
                     self.message_buffer
@@ -69,11 +78,15 @@ class TelegramLogHandler(StreamHandler):
                         or len("\n".join(self.message_buffer)) >= 3000
                     )
                 ):
+                    print(f"[TGLogger] пытаюсь отправить {len(self.message_buffer)} строк")
                     await self.handle_logs()
                     self.lines = 0
                     self.last_update = time.time()
+                else:
+                    if self.message_buffer:
+                        print(f"[TGLogger] буфер {len(self.message_buffer)} строк, жду...")
             except Exception as e:
-                print(f"TGLogger worker error: {e}")
+                print(f"[TGLogger worker error]: {e}")
             await asyncio.sleep(1)
 
     async def handle_logs(self, force_send=False):
@@ -93,11 +106,13 @@ class TelegramLogHandler(StreamHandler):
 
         if self.message_id and len(self.last_sent_content + '\n' + full_message) <= 4096:
             combined_message = self.last_sent_content + '\n' + full_message
+            print(f"[TGLogger] редактирую сообщение (добавляю {len(self.message_buffer)} строк)")
             sent_success = await self.edit_message(combined_message)
             if sent_success:
                 self.last_sent_content = combined_message
         else:
             chunks = self._split_into_chunks(full_message)
+            print(f"[TGLogger] отправка чанками: {len(chunks)} шт")
             for chunk in chunks:
                 if chunk.strip():
                     ok = await self.send_message(chunk)
@@ -105,6 +120,7 @@ class TelegramLogHandler(StreamHandler):
                         sent_success = True
 
         if sent_success:
+            print("[TGLogger] отправка успешна, очищаю буфер")
             self.message_buffer.clear()
 
     def _split_into_chunks(self, message):
@@ -152,6 +168,7 @@ class TelegramLogHandler(StreamHandler):
         if not is_alive:
             print("TGLogger: [ERROR] - Invalid bot token")
             return False
+        print(f"[TGLogger] бот {uname} инициализирован")
         self.initialized = True
         return True
 
@@ -179,6 +196,7 @@ class TelegramLogHandler(StreamHandler):
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
             self.last_sent_content = message
+            print(f"[TGLogger] сообщение отправлено (id={self.message_id})")
             return True
 
         await self.handle_error(res)
@@ -200,6 +218,7 @@ class TelegramLogHandler(StreamHandler):
         res = await self.send_request(f"{self.base_url}/editMessageText", payload)
         if res.get("ok"):
             self.last_sent_content = message
+            print(f"[TGLogger] сообщение обновлено (id={self.message_id})")
             return True
 
         await self.handle_error(res)
@@ -232,18 +251,18 @@ class TelegramLogHandler(StreamHandler):
         description = resp.get("description", "")
 
         if description == "message thread not found":
-            print(f"Thread {self.topic_id} not found - resetting")
+            print(f"[TGLogger] Thread {self.topic_id} not found - resetting")
             self.message_id = 0
             self.initialized = False
         elif error_code == 429:
             retry_after = error.get("retry_after", 30)
-            print(f'Floodwait: {retry_after} seconds')
+            print(f"[TGLogger] Floodwait {retry_after} сек")
             self.floodwait = retry_after
         elif "message to edit not found" in description:
-            print("Message to edit not found - resetting")
+            print("[TGLogger] Message to edit not found - resetting")
             self.message_id = 0
             self.initialized = False
         elif "message is not modified" in description:
-            print("Message not modified (no changes), skipping")
+            print("[TGLogger] Message not modified, skip")
         else:
-            print(f"Telegram API error: {description}")
+            print(f"[TGLogger] Telegram API error: {description}")
