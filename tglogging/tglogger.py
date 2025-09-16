@@ -13,10 +13,10 @@ DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
 class TelegramLogHandler(StreamHandler):
     """
-    Handler для синхронного кода.
-    Логи копятся в буфере, а фоновая задача шлёт их пачками в Telegram.
+    Синхронный логгер с накоплением буфера.
+    Логи копятся, а отдельная задача отправляет их каждые update_interval секунд.
     """
-    _handlers = weakref.WeakSet()
+    _handlers = weakref.WeakSet()  # Registry of all active handlers
 
     def __init__(
         self,
@@ -46,17 +46,17 @@ class TelegramLogHandler(StreamHandler):
         self.last_sent_content = ""  # Track last successfully sent content
         self._handlers.add(self)
 
-        # 🚀 Запускаем фонового воркера
+        # 🚀 Запуск фоновой задачи, которая шлёт логи каждые wait_time секунд
         self.loop.create_task(self._background_worker())
 
     def emit(self, record):
-        """Складываем сообщение в буфер (без ожидания отправки)."""
+        """Кладём сообщение в буфер (только копим)."""
         msg = self.format(record)
         self.lines += 1
         self.message_buffer.append(msg)
 
     async def _background_worker(self):
-        """Фоновая задача: периодически проверяет буфер и отправляет логи."""
+        """Фоновая задача — проверяет буфер и отправляет логи."""
         while True:
             try:
                 if (
@@ -105,7 +105,7 @@ class TelegramLogHandler(StreamHandler):
                         sent_success = True
 
         if sent_success:
-            self.message_buffer.clear()  # очищаем только после удачной отправки
+            self.message_buffer.clear()  # очищаем только после успешной отправки
 
     def _split_into_chunks(self, message):
         chunks = []
@@ -220,7 +220,9 @@ class TelegramLogHandler(StreamHandler):
             data = FormData()
             data.add_field("document", file, filename="logs.txt")
             async with session.post(
-                f"{self.base_url}/sendDocument", data=data, params=payload
+                f"{self.base_url}/sendDocument",
+                data=data,
+                params=payload
             ) as response:
                 await response.json()
 
