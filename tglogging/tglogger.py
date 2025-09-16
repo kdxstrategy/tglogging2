@@ -27,7 +27,7 @@ class TelegramLogHandler(StreamHandler):
         update_interval: int = 5,
         minimum_lines: int = 1,
         pending_logs: int = 200000,
-        timeout: int = 10,
+        timeout: int = 1,
     ):
         StreamHandler.__init__(self)
         self.loop = asyncio.get_event_loop()
