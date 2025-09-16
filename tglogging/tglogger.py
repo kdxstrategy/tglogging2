@@ -68,7 +68,6 @@ class TelegramLogHandler(StreamHandler):
         while True:
             try:
                 if self.floodwait > 0:
-                    print(f"[TGLogger] floodwait: {self.floodwait} сек")
                     self.floodwait -= 1
                 elif (
                     self.message_buffer
@@ -78,15 +77,11 @@ class TelegramLogHandler(StreamHandler):
                         or len("\n".join(self.message_buffer)) >= 3000
                     )
                 ):
-                    print(f"[TGLogger] пытаюсь отправить {len(self.message_buffer)} строк")
                     await self.handle_logs()
                     self.lines = 0
                     self.last_update = time.time()
-                else:
-                    if self.message_buffer:
-                        print(f"[TGLogger] буфер {len(self.message_buffer)} строк, жду...")
             except Exception as e:
-                print(f"[TGLogger worker error]: {e}")
+                print(f"TGLogger worker error: {e}")
             await asyncio.sleep(1)
 
     async def handle_logs(self, force_send=False):
@@ -106,13 +101,11 @@ class TelegramLogHandler(StreamHandler):
 
         if self.message_id and len(self.last_sent_content + '\n' + full_message) <= 4096:
             combined_message = self.last_sent_content + '\n' + full_message
-            print(f"[TGLogger] редактирую сообщение (добавляю {len(self.message_buffer)} строк)")
             sent_success = await self.edit_message(combined_message)
             if sent_success:
                 self.last_sent_content = combined_message
         else:
             chunks = self._split_into_chunks(full_message)
-            print(f"[TGLogger] отправка чанками: {len(chunks)} шт")
             for chunk in chunks:
                 if chunk.strip():
                     ok = await self.send_message(chunk)
@@ -120,7 +113,6 @@ class TelegramLogHandler(StreamHandler):
                         sent_success = True
 
         if sent_success:
-            print("[TGLogger] отправка успешна, очищаю буфер")
             self.message_buffer.clear()
 
     def _split_into_chunks(self, message):
@@ -168,7 +160,6 @@ class TelegramLogHandler(StreamHandler):
         if not is_alive:
             print("TGLogger: [ERROR] - Invalid bot token")
             return False
-        print(f"[TGLogger] бот {uname} инициализирован")
         self.initialized = True
         return True
 
@@ -196,7 +187,6 @@ class TelegramLogHandler(StreamHandler):
         if res.get("ok"):
             self.message_id = res["result"]["message_id"]
             self.last_sent_content = message
-            print(f"[TGLogger] сообщение отправлено (id={self.message_id})")
             return True
 
         await self.handle_error(res)
@@ -218,7 +208,6 @@ class TelegramLogHandler(StreamHandler):
         res = await self.send_request(f"{self.base_url}/editMessageText", payload)
         if res.get("ok"):
             self.last_sent_content = message
-            print(f"[TGLogger] сообщение обновлено (id={self.message_id})")
             return True
 
         await self.handle_error(res)
@@ -251,18 +240,18 @@ class TelegramLogHandler(StreamHandler):
         description = resp.get("description", "")
 
         if description == "message thread not found":
-            print(f"[TGLogger] Thread {self.topic_id} not found - resetting")
+            print(f"Thread {self.topic_id} not found - resetting")
             self.message_id = 0
             self.initialized = False
         elif error_code == 429:
             retry_after = error.get("retry_after", 30)
-            print(f"[TGLogger] Floodwait {retry_after} сек")
+            print(f'Floodwait: {retry_after} seconds')
             self.floodwait = retry_after
         elif "message to edit not found" in description:
-            print("[TGLogger] Message to edit not found - resetting")
+            print("Message to edit not found - resetting")
             self.message_id = 0
             self.initialized = False
         elif "message is not modified" in description:
-            print("[TGLogger] Message not modified, skip")
+            print("Message not modified (no changes), skipping")
         else:
-            print(f"[TGLogger] Telegram API error: {description}")
+            print(f"Telegram API error: {description}")
