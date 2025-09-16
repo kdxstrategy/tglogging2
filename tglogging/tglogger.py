@@ -14,7 +14,6 @@ class TelegramLogHandler(StreamHandler):
     _handlers = weakref.WeakSet()
     _worker_started = False
     _queue = None
-    _loop = None  # event loop для фонового режима
 
     def __init__(
         self,
@@ -44,50 +43,39 @@ class TelegramLogHandler(StreamHandler):
 
         self._handlers.add(self)
 
+        # глобальная очередь
         if TelegramLogHandler._queue is None:
             TelegramLogHandler._queue = asyncio.Queue()
 
-    def emit(self, record):
-        # запуск воркера лениво — при первом логе
+        # запуск воркера (и цикла, если он ещё не существует)
         if not TelegramLogHandler._worker_started:
-            self._ensure_worker()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                threading.Thread(target=loop.run_forever, daemon=True).start()
+            else:
+                pass
+            loop.create_task(self._worker())
             TelegramLogHandler._worker_started = True
 
+    def emit(self, record):
         msg = self.format(record)
         self.message_buffer.append(msg)
         self.lines += 1
         now = time.time()
 
+        buffer_text = "\n".join(self.message_buffer)
         if (
-            len("\n".join(self.message_buffer)) >= 3000
+            len(buffer_text) >= 3000
             or (now - self.last_update >= self.wait_time and self.lines >= self.minimum)
         ):
-            payload = "\n".join(self.message_buffer)
+            # отправляем весь буфер одним куском
+            asyncio.create_task(TelegramLogHandler._queue.put((self, buffer_text)))
             self.message_buffer = []
             self.lines = 0
             self.last_update = now
-            asyncio.run_coroutine_threadsafe(
-                TelegramLogHandler._queue.put((self, payload)), TelegramLogHandler._loop
-            )
-
-    def _ensure_worker(self):
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # нет активного event loop → создаём свой
-            loop = asyncio.new_event_loop()
-            TelegramLogHandler._loop = loop
-
-            def run_loop():
-                asyncio.set_event_loop(loop)
-                loop.run_forever()
-
-            threading.Thread(target=run_loop, daemon=True).start()
-        else:
-            TelegramLogHandler._loop = loop
-
-        # запускаем воркер
-        asyncio.run_coroutine_threadsafe(self._worker(), TelegramLogHandler._loop)
 
     async def _worker(self):
         """Фоновая задача, которая обрабатывает очередь"""
@@ -97,6 +85,7 @@ class TelegramLogHandler(StreamHandler):
                 await handler.handle_logs(message)
             except Exception as e:
                 print(f"[TGLogger] Worker error: {e}")
+                # возвращаем в очередь, чтобы не потерялось
                 await TelegramLogHandler._queue.put((handler, message))
                 await asyncio.sleep(5)
 
@@ -118,6 +107,8 @@ class TelegramLogHandler(StreamHandler):
             if success:
                 self.last_sent_content = combined_message
                 return
+
+        # иначе отправляем чанками
         for chunk in self._split_into_chunks(full_message):
             if chunk.strip():
                 ok = await self.send_message(chunk)
@@ -161,7 +152,7 @@ class TelegramLogHandler(StreamHandler):
 
     async def send_request(self, url, payload):
         try:
-            timeout = aiohttp.ClientTimeout(total=3)
+            timeout = aiohttp.ClientTimeout(total=10)
             async with ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload) as response:
                     return await response.json()
