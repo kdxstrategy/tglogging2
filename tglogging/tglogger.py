@@ -9,6 +9,8 @@ from aiohttp import ClientSession, FormData, ClientTimeout
 
 nest_asyncio.apply()
 
+DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
+
 
 class TelegramLogHandler(StreamHandler):
     """
@@ -43,13 +45,6 @@ class TelegramLogHandler(StreamHandler):
         self.last_sent_content = ""
         self._handlers.add(self)
 
-        # каждый хендлер имеет собственный payload
-        self.base_payload = {
-            "chat_id": self.log_chat_id,
-            "disable_web_page_preview": True,
-            "parse_mode": "Markdown",
-        }
-
         # создаём отдельный event loop в отдельном потоке
         self.loop = asyncio.new_event_loop()
         t = threading.Thread(target=self._run_loop, daemon=True)
@@ -73,7 +68,10 @@ class TelegramLogHandler(StreamHandler):
             try:
                 if self.floodwait > 0:
                     self.floodwait -= 1
-                elif (
+                    await asyncio.sleep(1)
+                    continue
+
+                if (
                     self.message_buffer
                     and (
                         time.time() - self.last_update >= self.wait_time
@@ -86,7 +84,9 @@ class TelegramLogHandler(StreamHandler):
                     self.last_update = time.time()
             except Exception as e:
                 print(f"TGLogger worker error: {e}")
-            await asyncio.sleep(1)
+
+            # Ждём именно update_interval, чтобы каждый хендлер работал независимо
+            await asyncio.sleep(self.wait_time)
 
     async def handle_logs(self, force_send=False):
         if not self.message_buffer or self.floodwait:
@@ -188,7 +188,8 @@ class TelegramLogHandler(StreamHandler):
         if not message.strip():
             return False
 
-        payload = self.base_payload.copy()
+        payload = DEFAULT_PAYLOAD.copy()
+        payload["chat_id"] = self.log_chat_id
         payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
@@ -209,7 +210,8 @@ class TelegramLogHandler(StreamHandler):
         if message == self.last_sent_content:
             return True
 
-        payload = self.base_payload.copy()
+        payload = DEFAULT_PAYLOAD.copy()
+        payload["chat_id"] = self.log_chat_id
         payload["message_id"] = self.message_id
         payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
@@ -229,7 +231,8 @@ class TelegramLogHandler(StreamHandler):
 
         file = io.BytesIO(f"k-server\n{logs}".encode())
         file.name = "logs.txt"
-        payload = self.base_payload.copy()
+        payload = DEFAULT_PAYLOAD.copy()
+        payload["chat_id"] = self.log_chat_id
         payload["caption"] = "```k-server\nLogs (too large for message)```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
