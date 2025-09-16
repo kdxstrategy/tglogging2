@@ -4,8 +4,7 @@ import asyncio
 import nest_asyncio
 import weakref
 from logging import StreamHandler
-from aiohttp import ClientSession, ClientConnectionError, ClientResponseError
-from concurrent.futures import ThreadPoolExecutor
+from aiohttp import ClientSession, FormData, ClientConnectionError, ClientResponseError
 
 nest_asyncio.apply()
 
@@ -14,11 +13,9 @@ DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 class TelegramLogHandler(StreamHandler):
     """
     Improved handler to send logs to Telegram chats with thread/topic support.
-    Preserves all messages during floodwait and connection issues, appends new logs to previous message when possible.
-    Works in synchronous context and handles connection timeouts without losing logs.
+    Preserves all messages during floodwait and appends new logs to previous message when possible.
     """
     _handlers = weakref.WeakSet()  # Registry of all active handlers
-    _executor = ThreadPoolExecutor(max_workers=1)  # For running async in sync context
 
     def __init__(
         self,
@@ -29,7 +26,7 @@ class TelegramLogHandler(StreamHandler):
         minimum_lines: int = 1,
         pending_logs: int = 200000,
     ):
-        super().__init__()
+        StreamHandler.__init__(self)
         try:
             self.loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -49,7 +46,7 @@ class TelegramLogHandler(StreamHandler):
         self.base_url = f"https://api.telegram.org/bot{token}"
         DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self.initialized = False
-        self.last_sent_content = ""
+        self.last_sent_content = ""  # Track last successfully sent content
         self._handlers.add(self)
         self._task = None
 
@@ -58,20 +55,28 @@ class TelegramLogHandler(StreamHandler):
         self.lines += 1
         self.message_buffer.append(msg)
         
+        # Check if we should send immediately due to size
         current_length = len('\n'.join(self.message_buffer))
         current_time = time.time()
-        
-        # Schedule send if buffer is large or time interval is met
-        if (current_length >= 3000 or 
-            (current_time - self.last_update >= max(self.wait_time, self.floodwait) and 
-             self.lines >= self.minimum)):
-            if not self.floodwait:
+        if current_length >= 3000:
+            if not self.floodwait:  # Only send if not in floodwait
                 self._schedule_send(current_time)
-                
-        # Check other handlers
+            # Buffer is preserved during floodwait
+        
+        # Check if we should send due to interval
+        diff = current_time - self.last_update
+        if diff >= max(self.wait_time, self.floodwait) and self.lines >= self.minimum:
+            if self.floodwait:
+                self.floodwait = 0  # Reset floodwait after waiting
+            self._schedule_send(current_time)
+        
+        # Check all other handlers for pending messages
         for handler in TelegramLogHandler._handlers:
-            if handler is self or not handler.message_buffer:
+            if handler is self:
                 continue
+            if not handler.message_buffer:
+                continue
+                
             time_diff = current_time - handler.last_update
             buffer_length = len('\n'.join(handler.message_buffer))
             if (time_diff >= max(handler.wait_time, handler.floodwait) and 
@@ -88,12 +93,12 @@ class TelegramLogHandler(StreamHandler):
         self.lines = 0
         self.last_update = current_time
 
-    async def handle_logs(self):
+    async def handle_logs(self, force_send=False):
         if not self.message_buffer or self.floodwait:
             return
 
         full_message = '\n'.join(self.message_buffer)
-        self.message_buffer = []  # Clear buffer after copying
+        self.message_buffer = []  # Clear buffer only after checking floodwait
         
         if not full_message.strip():
             return
@@ -102,32 +107,37 @@ class TelegramLogHandler(StreamHandler):
         if not self.initialized:
             success = await self._safe_initialize_bot()
             if not success:
-                self.message_buffer = [full_message]
+                self.message_buffer = [full_message]  # Restore buffer if init fails
                 return
 
-        # Try to append to existing message
+        # Check if we can append to the existing message
         if self.message_id and len(self.last_sent_content + '\n' + full_message) <= 4096:
             combined_message = self.last_sent_content + '\n' + full_message
             success = await self._safe_edit_message(combined_message)
             if success:
                 self.last_sent_content = combined_message
             else:
+                # If edit fails, send as new message
                 await self._safe_send_message(full_message)
         else:
+            # Send as new message(s)
             chunks = self._split_into_chunks(full_message)
             for chunk in chunks:
                 if chunk.strip():
                     await self._safe_send_message(chunk)
 
     def _split_into_chunks(self, message):
+        """Split message into chunks respecting line boundaries and size limits"""
         chunks = []
         current_chunk = ""
         lines = message.split('\n')
         
         for line in lines:
+            # Preserve empty lines
             if line == "":
                 line = " "
             
+            # If line is too long, split it
             while len(line) > 4096:
                 split_pos = line[:4096].rfind(' ')
                 if split_pos <= 0:
@@ -144,6 +154,7 @@ class TelegramLogHandler(StreamHandler):
                     chunks.append(current_chunk)
                     current_chunk = ""
             
+            # Add line to chunk
             if len(current_chunk) + len(line) + 1 <= 4096:
                 if current_chunk:
                     current_chunk += '\n' + line
@@ -160,6 +171,7 @@ class TelegramLogHandler(StreamHandler):
         return chunks
 
     async def _safe_initialize_bot(self):
+        """Initialize bot connection without sending an initial message"""
         try:
             uname, is_alive = await self.verify_bot()
             if not is_alive:
@@ -278,6 +290,7 @@ class TelegramLogHandler(StreamHandler):
             retry_after = error.get("retry_after", 30)
             print(f'Floodwait: {retry_after} seconds')
             self.floodwait = retry_after
+            # Buffer is preserved, no need to restore here
         elif error_code == 503 or "timeout" in description.lower():
             print(f"Connection timeout: {description}")
         elif "message to edit not found" in description:
