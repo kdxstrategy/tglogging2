@@ -9,8 +9,6 @@ from aiohttp import ClientSession, FormData, ClientTimeout
 
 nest_asyncio.apply()
 
-DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
-
 
 class TelegramLogHandler(StreamHandler):
     """
@@ -41,10 +39,16 @@ class TelegramLogHandler(StreamHandler):
         self.lines = 0
         self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
-        DEFAULT_PAYLOAD.update({"chat_id": self.log_chat_id})
         self.initialized = False
         self.last_sent_content = ""
         self._handlers.add(self)
+
+        # каждый хендлер имеет собственный payload
+        self.base_payload = {
+            "chat_id": self.log_chat_id,
+            "disable_web_page_preview": True,
+            "parse_mode": "Markdown",
+        }
 
         # создаём отдельный event loop в отдельном потоке
         self.loop = asyncio.new_event_loop()
@@ -184,7 +188,7 @@ class TelegramLogHandler(StreamHandler):
         if not message.strip():
             return False
 
-        payload = DEFAULT_PAYLOAD.copy()
+        payload = self.base_payload.copy()
         payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
@@ -205,7 +209,7 @@ class TelegramLogHandler(StreamHandler):
         if message == self.last_sent_content:
             return True
 
-        payload = DEFAULT_PAYLOAD.copy()
+        payload = self.base_payload.copy()
         payload["message_id"] = self.message_id
         payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
@@ -225,7 +229,7 @@ class TelegramLogHandler(StreamHandler):
 
         file = io.BytesIO(f"k-server\n{logs}".encode())
         file.name = "logs.txt"
-        payload = DEFAULT_PAYLOAD.copy()
+        payload = self.base_payload.copy()
         payload["caption"] = "```k-server\nLogs (too large for message)```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
