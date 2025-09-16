@@ -41,12 +41,15 @@ class TelegramLogHandler(StreamHandler):
         self.lines = 0
         self.last_update = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
+        self.payload_base = DEFAULT_PAYLOAD.copy()
+        self.payload_base.update({"chat_id": self.log_chat_id})
         self.initialized = False
         self.last_sent_content = ""
         self._handlers.add(self)
 
         # создаём отдельный event loop в отдельном потоке
         self.loop = asyncio.new_event_loop()
+        self._stop_event = threading.Event()
         t = threading.Thread(target=self._run_loop, daemon=True)
         t.start()
 
@@ -64,7 +67,7 @@ class TelegramLogHandler(StreamHandler):
 
     async def _background_worker(self):
         """Фоновая задача — проверяет буфер и отправляет логи"""
-        while True:
+        while not self._stop_event.is_set():
             try:
                 if self.floodwait > 0:
                     self.floodwait -= 1
@@ -85,7 +88,6 @@ class TelegramLogHandler(StreamHandler):
             except Exception as e:
                 print(f"TGLogger worker error: {e}")
 
-            # Ждём именно update_interval, чтобы каждый хендлер работал независимо
             await asyncio.sleep(self.wait_time)
 
     async def handle_logs(self, force_send=False):
@@ -188,8 +190,7 @@ class TelegramLogHandler(StreamHandler):
         if not message.strip():
             return False
 
-        payload = DEFAULT_PAYLOAD.copy()
-        payload["chat_id"] = self.log_chat_id
+        payload = self.payload_base.copy()
         payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
@@ -210,8 +211,7 @@ class TelegramLogHandler(StreamHandler):
         if message == self.last_sent_content:
             return True
 
-        payload = DEFAULT_PAYLOAD.copy()
-        payload["chat_id"] = self.log_chat_id
+        payload = self.payload_base.copy()
         payload["message_id"] = self.message_id
         payload["text"] = f"```k-server\n{message}```"
         if self.topic_id:
@@ -231,8 +231,7 @@ class TelegramLogHandler(StreamHandler):
 
         file = io.BytesIO(f"k-server\n{logs}".encode())
         file.name = "logs.txt"
-        payload = DEFAULT_PAYLOAD.copy()
-        payload["chat_id"] = self.log_chat_id
+        payload = self.payload_base.copy()
         payload["caption"] = "```k-server\nLogs (too large for message)```"
         if self.topic_id:
             payload["message_thread_id"] = self.topic_id
@@ -269,3 +268,24 @@ class TelegramLogHandler(StreamHandler):
             print("Message not modified (no changes), skipping")
         else:
             print(f"Telegram API error: {description}")
+
+    def flush_and_close(self):
+        """Отправить все логи и корректно закрыть loop"""
+        async def _final_flush():
+            if self.message_buffer:
+                await self.handle_logs(force_send=True)
+            self._stop_event.set()
+
+        if self.loop and self.loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(_final_flush(), self.loop)
+            try:
+                fut.result(timeout=5)  # ждём максимум 5 сек
+            except Exception as e:
+                print(f"Flush error: {e}")
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+    def __del__(self):
+        try:
+            self.flush_and_close()
+        except Exception:
+            pass
