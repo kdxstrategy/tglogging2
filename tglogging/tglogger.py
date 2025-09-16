@@ -22,18 +22,20 @@ class TelegramLogHandler(StreamHandler):
         token: str,
         log_chat_id: int,
         topic_id: int = None,
-        flush_interval: float = 1.0,
+        update_interval: float = 5.0,
+        minimum_lines: int = 1,
         pending_logs: int = 200000,
     ):
         super().__init__()
         self.token = token
         self.log_chat_id = int(log_chat_id)
         self.default_topic_id = int(topic_id) if topic_id else None
-        self.flush_interval = flush_interval
+        self.update_interval = update_interval
+        self.minimum = minimum_lines
         self.pending = pending_logs
 
         # буферы по каждому topic
-        self.buffers: dict[int | None, list[str]] = {}
+        self.buffers: dict[int | None, dict] = {}
         self.message_ids: dict[int | None, int] = {}
         self.last_sent: dict[int | None, str] = {}
         self.floodwait = 0
@@ -55,8 +57,20 @@ class TelegramLogHandler(StreamHandler):
     def emit(self, record):
         msg = self.format(record)
         topic = self.default_topic_id
-        buf = self.buffers.setdefault(topic, [])
-        buf.append(msg)
+        buf = self.buffers.setdefault(
+            topic, {"messages": [], "lines": 0, "last_update": time.time()}
+        )
+
+        buf["messages"].append(msg)
+        buf["lines"] += 1
+        now = time.time()
+
+        # если накопилось достаточно строк — сразу в очередь
+        if buf["lines"] >= self.minimum:
+            self._enqueue((self, topic, "\n".join(buf["messages"])))
+            buf["messages"] = []
+            buf["lines"] = 0
+            buf["last_update"] = now
 
     def _enqueue(self, item):
         try:
@@ -94,12 +108,15 @@ class TelegramLogHandler(StreamHandler):
 
     async def _flusher(self):
         while True:
-            await asyncio.sleep(self.flush_interval)
-            for topic, msgs in list(self.buffers.items()):
-                if msgs:
-                    buffer_text = "\n".join(msgs)
+            await asyncio.sleep(0.5)  # проверяем чаще, чем update_interval
+            now = time.time()
+            for topic, buf in list(self.buffers.items()):
+                if buf["messages"] and (now - buf["last_update"] >= self.update_interval):
+                    buffer_text = "\n".join(buf["messages"])
                     self._enqueue((self, topic, buffer_text))
-                    self.buffers[topic] = []
+                    buf["messages"] = []
+                    buf["lines"] = 0
+                    buf["last_update"] = now
 
     async def _worker(self):
         if not TelegramLogHandler._session:
