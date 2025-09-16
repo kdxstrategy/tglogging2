@@ -32,12 +32,11 @@ class TelegramLogHandler(StreamHandler):
         self.minimum = minimum_lines
         self.pending = pending_logs
 
-        # буферы по каждому topic
+        # буферы на каждый topic
         self.buffers: dict[int | None, dict] = {}
-        self.message_ids: dict[int | None, int] = {}
+        # состояние по каждому topic
         self.last_sent: dict[int | None, str] = {}
-        self.last_flush: dict[int | None, float] = {}
-
+        self.message_ids: dict[int | None, int] = {}
         self.floodwait = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.initialized = False
@@ -55,7 +54,6 @@ class TelegramLogHandler(StreamHandler):
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self._worker())
-            loop.create_task(self._flush_timer())
             print("[TGLogger] Worker attached to existing loop")
         except RuntimeError:
             TelegramLogHandler._loop = asyncio.new_event_loop()
@@ -63,7 +61,6 @@ class TelegramLogHandler(StreamHandler):
             def run_loop(loop):
                 asyncio.set_event_loop(loop)
                 loop.create_task(self._worker())
-                loop.create_task(self._flush_timer())
                 loop.run_forever()
 
             TelegramLogHandler._thread = threading.Thread(
@@ -76,21 +73,22 @@ class TelegramLogHandler(StreamHandler):
         msg = self.format(record)
         topic = self.default_topic_id
         buf = self.buffers.setdefault(
-            topic, {"messages": [], "lines": 0}
+            topic, {"messages": [], "lines": 0, "last_update": 0}
         )
 
         buf["messages"].append(msg)
         buf["lines"] += 1
-
-        buffer_text = "\n".join(buf["messages"])
         now = time.time()
 
-        # Сразу отправляем, если буфер очень большой
-        if len(buffer_text) >= 3000 or buf["lines"] >= 50:
+        buffer_text = "\n".join(buf["messages"])
+        if (
+            len(buffer_text) >= 3000
+            or (now - buf["last_update"] >= self.wait_time and buf["lines"] >= self.minimum)
+        ):
             self._enqueue((self, topic, buffer_text))
-            buf["messages"].clear()
+            buf["messages"] = []
             buf["lines"] = 0
-            self.last_flush[topic] = now
+            buf["last_update"] = now
 
     def _enqueue(self, item):
         try:
@@ -109,23 +107,8 @@ class TelegramLogHandler(StreamHandler):
                 await handler.handle_logs(topic, message)
             except Exception as e:
                 print(f"[TGLogger] Worker error: {e}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(5)
                 handler._enqueue((handler, topic, message))
-
-    async def _flush_timer(self):
-        """Фоновый таймер: каждые update_interval секунд проверяет буферы"""
-        while True:
-            await asyncio.sleep(self.wait_time)
-            now = time.time()
-            for topic, buf in list(self.buffers.items()):
-                if buf["messages"]:
-                    last = self.last_flush.get(topic, 0)
-                    if now - last >= self.wait_time and buf["lines"] >= self.minimum:
-                        buffer_text = "\n".join(buf["messages"])
-                        self._enqueue((self, topic, buffer_text))
-                        buf["messages"].clear()
-                        buf["lines"] = 0
-                        self.last_flush[topic] = now
 
     async def handle_logs(self, topic_id: int | None, full_message: str):
         if not full_message.strip() or self.floodwait:
