@@ -161,7 +161,7 @@ class TelegramLogHandler(StreamHandler):
 
     async def send_request(self, url, payload):
         try:
-            timeout = aiohttp.ClientTimeout(total=15)
+            timeout = aiohttp.ClientTimeout(total=3)
             async with ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload) as response:
                     return await response.json()
