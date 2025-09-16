@@ -8,21 +8,19 @@ from aiohttp import ClientSession, ClientError, ClientConnectorError, ServerTime
 
 DEFAULT_PAYLOAD = {"disable_web_page_preview": True, "parse_mode": "Markdown"}
 
-
 class TelegramLogHandler(StreamHandler):
     _handlers = weakref.WeakSet()
     _worker_started = False
     _queue = None
     _loop = None
     _thread = None
-    _session: ClientSession | None = None
 
     def __init__(
         self,
         token: str,
         log_chat_id: int,
         topic_id: int = None,
-        update_interval: float = 5.0,
+        update_interval: int = 5,
         minimum_lines: int = 1,
         pending_logs: int = 200000,
     ):
@@ -30,7 +28,7 @@ class TelegramLogHandler(StreamHandler):
         self.token = token
         self.log_chat_id = int(log_chat_id)
         self.default_topic_id = int(topic_id) if topic_id else None
-        self.update_interval = update_interval
+        self.wait_time = update_interval
         self.minimum = minimum_lines
         self.pending = pending_logs
 
@@ -38,6 +36,8 @@ class TelegramLogHandler(StreamHandler):
         self.buffers: dict[int | None, dict] = {}
         self.message_ids: dict[int | None, int] = {}
         self.last_sent: dict[int | None, str] = {}
+        self.last_flush: dict[int | None, float] = {}
+
         self.floodwait = 0
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.initialized = False
@@ -51,26 +51,46 @@ class TelegramLogHandler(StreamHandler):
             self._start_worker()
             TelegramLogHandler._worker_started = True
 
-    # -----------------------
-    # Logging
-    # -----------------------
+    def _start_worker(self):
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._worker())
+            loop.create_task(self._flush_timer())
+            print("[TGLogger] Worker attached to existing loop")
+        except RuntimeError:
+            TelegramLogHandler._loop = asyncio.new_event_loop()
+
+            def run_loop(loop):
+                asyncio.set_event_loop(loop)
+                loop.create_task(self._worker())
+                loop.create_task(self._flush_timer())
+                loop.run_forever()
+
+            TelegramLogHandler._thread = threading.Thread(
+                target=run_loop, args=(TelegramLogHandler._loop,), daemon=True
+            )
+            TelegramLogHandler._thread.start()
+            print("[TGLogger] Worker running in background thread")
+
     def emit(self, record):
         msg = self.format(record)
         topic = self.default_topic_id
         buf = self.buffers.setdefault(
-            topic, {"messages": [], "lines": 0, "last_update": time.time()}
+            topic, {"messages": [], "lines": 0}
         )
 
         buf["messages"].append(msg)
         buf["lines"] += 1
+
+        buffer_text = "\n".join(buf["messages"])
         now = time.time()
 
-        # если накопилось достаточно строк — сразу в очередь
-        if buf["lines"] >= self.minimum:
-            self._enqueue((self, topic, "\n".join(buf["messages"])))
-            buf["messages"] = []
+        # Сразу отправляем, если буфер очень большой
+        if len(buffer_text) >= 3000 or buf["lines"] >= 50:
+            self._enqueue((self, topic, buffer_text))
+            buf["messages"].clear()
             buf["lines"] = 0
-            buf["last_update"] = now
+            self.last_flush[topic] = now
 
     def _enqueue(self, item):
         try:
@@ -82,59 +102,31 @@ class TelegramLogHandler(StreamHandler):
                     asyncio.create_task, TelegramLogHandler._queue.put(item)
                 )
 
-    # -----------------------
-    # Background loop
-    # -----------------------
-    def _start_worker(self):
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._worker())
-            loop.create_task(self._flusher())
-            print("[TGLogger] Worker attached to existing loop")
-        except RuntimeError:
-            TelegramLogHandler._loop = asyncio.new_event_loop()
-
-            def run_loop(loop):
-                asyncio.set_event_loop(loop)
-                loop.create_task(self._worker())
-                loop.create_task(self._flusher())
-                loop.run_forever()
-
-            TelegramLogHandler._thread = threading.Thread(
-                target=run_loop, args=(TelegramLogHandler._loop,), daemon=True
-            )
-            TelegramLogHandler._thread.start()
-            print("[TGLogger] Worker running in background thread")
-
-    async def _flusher(self):
-        while True:
-            await asyncio.sleep(0.5)  # проверяем чаще, чем update_interval
-            now = time.time()
-            for topic, buf in list(self.buffers.items()):
-                if buf["messages"] and (now - buf["last_update"] >= self.update_interval):
-                    buffer_text = "\n".join(buf["messages"])
-                    self._enqueue((self, topic, buffer_text))
-                    buf["messages"] = []
-                    buf["lines"] = 0
-                    buf["last_update"] = now
-
     async def _worker(self):
-        if not TelegramLogHandler._session:
-            TelegramLogHandler._session = ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            )
         while True:
             handler, topic, message = await TelegramLogHandler._queue.get()
             try:
                 await handler.handle_logs(topic, message)
             except Exception as e:
                 print(f"[TGLogger] Worker error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
                 handler._enqueue((handler, topic, message))
 
-    # -----------------------
-    # Telegram API
-    # -----------------------
+    async def _flush_timer(self):
+        """Фоновый таймер: каждые update_interval секунд проверяет буферы"""
+        while True:
+            await asyncio.sleep(self.wait_time)
+            now = time.time()
+            for topic, buf in list(self.buffers.items()):
+                if buf["messages"]:
+                    last = self.last_flush.get(topic, 0)
+                    if now - last >= self.wait_time and buf["lines"] >= self.minimum:
+                        buffer_text = "\n".join(buf["messages"])
+                        self._enqueue((self, topic, buffer_text))
+                        buf["messages"].clear()
+                        buf["lines"] = 0
+                        self.last_flush[topic] = now
+
     async def handle_logs(self, topic_id: int | None, full_message: str):
         if not full_message.strip() or self.floodwait:
             await asyncio.sleep(self.floodwait or 1)
@@ -200,8 +192,10 @@ class TelegramLogHandler(StreamHandler):
 
     async def send_request(self, url, payload):
         try:
-            async with TelegramLogHandler._session.post(url, json=payload) as response:
-                return await response.json()
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as response:
+                    return await response.json()
         except (asyncio.TimeoutError, ClientConnectorError, ServerTimeoutError) as e:
             print(f"[TGLogger] Timeout: {e}")
             return {"ok": False, "description": str(e)}
@@ -220,7 +214,7 @@ class TelegramLogHandler(StreamHandler):
 
     async def send_message(self, topic_id, message):
         payload = DEFAULT_PAYLOAD.copy()
-        payload["text"] = f"```k-server\n{message}```"
+        payload["text"] = f"k-server\n{message}"
         payload["chat_id"] = self.log_chat_id
         if topic_id:
             payload["message_thread_id"] = topic_id
@@ -236,7 +230,7 @@ class TelegramLogHandler(StreamHandler):
     async def edit_message(self, topic_id, message_id, message):
         payload = DEFAULT_PAYLOAD.copy()
         payload["message_id"] = message_id
-        payload["text"] = f"```k-server\n{message}```"
+        payload["text"] = f"k-server\n{message}"
         payload["chat_id"] = self.log_chat_id
         if topic_id:
             payload["message_thread_id"] = topic_id
